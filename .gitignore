@@ -19,6 +19,9 @@ out/
 ### Kotlin ###
 .kotlin
 
+### Android / local machine config ###
+local.properties
+
 ### Eclipse ###
 .apt_generated
 .classpath
@@ -44,3 +47,11 @@ bin/
 ### Mac OS ###
 .DS_Store
 /.idea/
+
+### Xcode ###
+xcuserdata/
+DerivedData/
+*.xcuserstate
+
+### Superpowers ###
+.superpowers/
