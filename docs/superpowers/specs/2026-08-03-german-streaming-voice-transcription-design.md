@@ -4,9 +4,9 @@ Date: 2026-08-03
 
 ## Purpose
 
-Prove that fully on-device, streaming speech-to-text is feasible for German
-clinical dictation on mobile — with no audio or transcript data ever leaving
-the device, and no dependency on a third-party cloud service.
+Prove that fully on-device speech-to-text is feasible for German clinical
+dictation on mobile — with no audio or transcript data ever leaving the
+device, and no dependency on a third-party cloud service.
 
 This is a proof of concept, not a product. Scope is deliberately narrow:
 demonstrate the pipeline works end-to-end on both Android and iOS with
@@ -16,8 +16,12 @@ subjectively acceptable German transcription quality.
 
 - Fully on-device speech-to-text — no network calls, no cloud STT vendor.
 - German language support.
-- "Live-ish" transcription: text appears while the user is still speaking,
-  segmented at natural pauses, rather than only after recording stops.
+- "Live-ish" transcription: as the user speaks, each pause in speech
+  finalizes and transcribes the segment just spoken, so the transcript grows
+  in pieces while recording continues — rather than waiting for the whole
+  recording to end before showing any text. Note: within a segment (before a
+  pause is detected), no partial/word-by-word text is shown; text appears
+  once that segment finishes processing, right after the pause.
 - Runs on both Android and iOS from a shared Kotlin Multiplatform codebase.
 
 ## Non-goals
@@ -26,6 +30,8 @@ subjectively acceptable German transcription quality.
 - Formal accuracy measurement (e.g. word-error-rate) against a reference
   transcript set.
 - Support for languages other than German.
+- True word-by-word streaming (partial hypotheses mid-utterance, before a
+  pause is detected) — see the "live-ish" note in Goals.
 - Handling audio interruptions (calls, other apps taking the mic),
   backgrounding during recording, or unsupported/low-end devices gracefully.
 - Medical-vocabulary tuning (custom lexicon/fine-tuning) — the PoC evaluates
@@ -53,55 +59,79 @@ A bundled, open-source model that we run ourselves gives a stronger,
 auditable compliance story (the exact code path touching audio is ours to
 inspect) and consistent behavior across both platforms.
 
-## Why sherpa-onnx over Whisper
-
-Whisper (via whisper.cpp) was the first candidate considered: it has the
-largest community and strongest general multilingual accuracy reputation of
-the open options. It was set aside because it is architecturally a **batch**
-model — it processes fixed windows, not a true streaming design. Achieving
-"live-ish" transcription with Whisper would mean bolting a custom
-pause-detector (VAD) onto a model that wasn't built for incremental use,
-with known rough edges (repetition/instability at chunk boundaries).
+## Model choice: Whisper (whisper.cpp), after a sherpa-onnx detour
 
 **sherpa-onnx** (next-generation Kaldi, streaming transformer models via
-ONNX Runtime) was chosen instead because:
+ONNX Runtime) was the first choice, because it's purpose-built for real-time
+streaming ASR with endpoint (utterance-boundary) detection built in — which
+would have given "live-ish" segmentation for free, including true
+word-by-word partial hypotheses. It was reversed after implementation
+research found:
 
-- It is purpose-built for real-time streaming ASR, including endpoint
-  (utterance-boundary) detection as a first-class runtime feature — so we
-  get "live-ish" segmentation for free, rather than building our own VAD.
-- It ships official, actively maintained bindings for both Android (Kotlin/
-  JNI) and iOS (C API), from the same upstream project — not third-party
-  wrappers of divergent quality/versions.
-- It includes German streaming models.
-- It supports hotword/vocabulary biasing, relevant to medical terminology.
+- **No German model in sherpa-onnx's own official model zoo.** Its
+  documented streaming models cover Chinese, English, Korean, French,
+  Bengali, Russian, etc. — not German.
+- The only German streaming model found, **Kroko-ASR** (by a company called
+  Banafo), is a third-party project. Its official distribution ships a
+  proprietary `.data` format with its own decoder script — **not** standard
+  sherpa-onnx files — so it isn't natively sherpa-onnx-compatible despite
+  being built on sherpa-onnx's engine.
+- The only sherpa-onnx-native version of that German model (encoder/decoder/
+  joiner ONNX + tokens.txt) found was an **unofficial third-party conversion**
+  on Hugging Face, unverified by Kroko or sherpa-onnx maintainers, and
+  relicensed (claiming Apache-2.0) in a way that conflicts with Kroko's own
+  stated terms (CC-BY-SA community / commercial OEM license). Building the
+  PoC's core pipeline on an unvetted, ambiguously-licensed conversion was
+  judged too risky, including for a PoC.
 
-Vosk (Kaldi-based) was also considered: it is purpose-built for offline
-mobile ASR with ready German models and official mobile bindings, but its
-older DNN-HMM architecture has a lower accuracy ceiling, particularly on
-out-of-vocabulary terms like medical drug names, and the ecosystem has less
-ongoing research investment than transformer-based ASR.
+**Whisper (via whisper.cpp)** was chosen instead:
 
-**Exact model choice** (which specific pretrained streaming German model
-from sherpa-onnx's model zoo) is not locked in this design — it's a research
-spike during implementation, decided by testing candidates for size/latency/
-accuracy trade-offs on real devices.
+- Officially distributed by OpenAI/the `ggml-org/whisper.cpp` project (no
+  third-party mirror risk); model weights are MIT-licensed, free for
+  commercial and non-commercial use.
+- Strong, well-documented multilingual accuracy including German.
+- `whisper.cpp` ships official build paths for both Android (JNI, via
+  Gradle/NDK — see `examples/whisper.android.java`) and iOS (an
+  `xcframework` via `build-xcframework.sh`, used from Swift — see
+  `examples/whisper.swiftui`). We write our own thin binding against its
+  public C API rather than depending on a third-party wrapper, for the same
+  auditability reasons discussed above.
+
+**Trade-off accepted**: Whisper is architecturally a **batch** model — it
+transcribes a fixed buffer in one pass, with no built-in streaming or
+endpoint detection. To get "live-ish" behavior, we detect pauses ourselves
+(a simple RMS energy-based silence detector, implemented in shared Kotlin)
+and transcribe each pause-delimited segment as soon as it's detected, while
+recording continues. This means segments finalize a beat after each pause
+(no mid-utterance partial text), rather than the smoother true-streaming
+experience sherpa-onnx would have offered.
+
+**Model size**: the multilingual `small` ggml model (~466 MiB) is the
+starting point, favoring accuracy per the earlier decision to prioritize
+transcription quality over latency/app size. `medium` (~1.5 GiB) is a
+fallback to try if `small`'s German accuracy is not good enough on real
+devices. Both are downloaded from the official
+`https://huggingface.co/ggerganov/whisper.cpp` model repo.
 
 ## Architecture
 
 - **Project structure**: Kotlin Multiplatform targeting Android and iOS. A
-  `shared` module holds common logic; `androidApp`/`iosApp` hold thin
-  platform entry points and UI.
-- **Native ASR engine**: sherpa-onnx's official prebuilt binaries and
-  bindings — its Kotlin/JNI API on Android, its C API (via Kotlin/Native
-  cinterop) on iOS.
+  `shared` module holds common logic and the UI (see UI Scope below);
+  `androidApp`/`iosApp` hold thin platform entry points.
+- **Native ASR engine**: `whisper.cpp`'s C API, bundled and compiled
+  ourselves — via NDK/CMake on Android, via its `build-xcframework.sh`
+  output on iOS — bound into Kotlin through a single `expect`/`actual`
+  interface (JNI on Android, Kotlin/Native cinterop on iOS).
 - **Audio capture**: platform-specific mic capture (`AVAudioEngine` on iOS,
   `AudioRecord` on Android) behind an `expect`/`actual` interface, producing
-  raw PCM frames at the sample rate the model expects (typically 16kHz
-  mono).
-- **Pipeline**: PCM frames → streaming recognizer (fed continuously) →
-  recognizer emits partial hypotheses (growing live text) and endpoint
-  signals (segment boundaries: finalized text + reset for the next
-  utterance).
+  raw PCM frames at 16kHz mono (the sample rate Whisper expects).
+- **Pause detection (VAD)**: a simple RMS energy-based silence detector,
+  implemented once in shared Kotlin (`commonMain`) since it operates purely
+  on PCM sample data — no platform dependency needed.
+- **Pipeline**: PCM frames accumulate into the current segment's buffer;
+  the pause detector watches for a trailing silence window; on detection,
+  the accumulated buffer is handed to the Whisper engine for transcription,
+  the result is appended to the transcript, and a new segment buffer starts.
 - **No network calls, ever** — the recognizer runs fully offline. There is
   no code path that could transmit audio or transcript data anywhere,
   satisfying the no-third-party-access requirement architecturally.
@@ -112,37 +142,47 @@ accuracy trade-offs on real devices.
 
 - **`AudioCapture`** (`expect`/`actual`) — platform mic session, emits raw
   PCM buffers as they arrive (roughly every ~100ms).
-- **`StreamingSpeechRecognizer`** (`expect`/`actual`) — thin wrapper around
-  sherpa-onnx's streaming recognizer API per platform. Exposes: feed a PCM
-  buffer, read the current partial hypothesis, check/consume an endpoint
-  event.
+- **`PauseDetector`** (`commonMain`, pure Kotlin) — consumes PCM buffers,
+  tracks trailing silence duration via RMS energy against a threshold, and
+  reports when a pause boundary is reached.
+- **`WhisperEngine`** (`expect`/`actual`) — thin wrapper around
+  `whisper.cpp`'s C API per platform. Exposes one operation: transcribe a
+  complete PCM buffer (a finalized segment) and return its text. This is a
+  batch call, not a streaming one — it's invoked once per completed segment.
 - **`TranscriptionSession`** (pure Kotlin, `commonMain`, no platform
   dependency) — orchestrates the loop: pull frames from `AudioCapture` →
-  feed to `StreamingSpeechRecognizer` → read partial text → on endpoint,
-  move the finalized segment into transcript history and reset the stream
-  for the next utterance. Being platform-independent, it's unit-testable
-  against fakes without real audio hardware or the ONNX model.
+  feed to `PauseDetector` and accumulate into the current segment buffer →
+  on pause, send the buffer to `WhisperEngine` → append the returned text to
+  transcript history → start a new segment buffer. Being platform-independent,
+  it's unit-testable against fakes without real audio hardware or the model.
 - **UI state** — a state holder (e.g. `StateFlow`) with: list of finalized
-  segments, current in-progress partial text, and recording on/off state.
-  The UI renders this reactively.
+  segments, recording on/off state, and any error state (permission denied,
+  model load failure). The UI renders this reactively.
 
 **Data flow:**
 
 1. Tap Record → `AudioCapture` starts the mic session.
-2. Each PCM buffer → fed into the recognizer → session reads back the
-   partial hypothesis → UI's in-progress text updates live.
-3. When the recognizer signals an endpoint (silence/pause) → session
-   finalizes that segment's text, appends it to transcript history, resets
-   the recognizer stream, and continues listening.
-4. Tap Stop → `AudioCapture` stops, session flushes any trailing partial
-   text as a final segment, recognizer resources are released.
-5. Final transcript = finalized segments + any trailing partial, held only
-   in memory. Closing the app discards it — no persistence.
+2. Each PCM buffer → appended to the current segment buffer, and fed to
+   `PauseDetector`.
+3. When `PauseDetector` signals a pause boundary → the session sends the
+   accumulated segment buffer to `WhisperEngine.transcribe(...)` → the
+   returned text is appended to transcript history → the UI's transcript
+   view updates → a new, empty segment buffer starts accumulating.
+4. Tap Stop → `AudioCapture` stops; if the current segment buffer has any
+   audio in it (even without a detected pause), it's force-transcribed and
+   appended as a final segment; `WhisperEngine` resources are released.
+5. Final transcript = all finalized segments, held only in memory. Closing
+   the app discards it — no persistence.
 
 ## UI Scope
 
 Bare minimum: a single screen with a record/stop button and a growing
 transcript text view. No save, export, or history across sessions.
+
+Built with **Compose Multiplatform**, shared in the `shared` module for both
+platforms — one UI codebase rather than separate Jetpack Compose / SwiftUI
+implementations, consistent with maximizing shared code for a screen this
+simple.
 
 ## Error Handling & Edge Cases
 
@@ -155,10 +195,10 @@ transcript text view. No save, export, or history across sessions.
 - **Model load failure** (missing/corrupt bundled model, init failure) —
   caught at app start or first use, surfaced as a clear error state rather
   than a crash.
-- **No natural pause before Stop is tapped** — if the recognizer never
-  signals an endpoint (continuous speech, or the user stops mid-utterance),
-  the session force-finalizes whatever partial text exists when Stop is
-  pressed, so nothing is silently dropped.
+- **No pause detected before Stop is tapped** — if the user stops mid-
+  utterance (no trailing silence long enough to trigger a pause boundary),
+  the session force-transcribes whatever audio is in the current segment
+  buffer when Stop is pressed, so nothing is silently dropped.
 - **Silence-only recording** — no speech detected produces an empty
   transcript, not an error.
 - **App backgrounded mid-recording** — recording stops automatically when
@@ -173,21 +213,26 @@ transcript text view. No save, export, or history across sessions.
 
 - Audio interruptions (incoming call, another app grabbing the mic).
 - Unsupported/low-end devices (missing CPU features, insufficient RAM).
-- Recognizer falling behind real-time on slower devices — observed and
+- The Whisper engine falling behind real-time on slower devices (a segment
+  taking noticeably long to transcribe after its pause) — observed and
   noted as a finding, not engineered around.
+- Tuning the pause-detection threshold/timing for varied recording
+  conditions (background noise, different mic sensitivities) — a fixed,
+  reasonable default is used; robustness across environments is not a goal.
 
 ## Testing & Success Criteria
 
-- **Unit tests**: `TranscriptionSession` is tested with a fake `AudioCapture`
-  (feeding canned PCM data) and a fake `StreamingSpeechRecognizer` (returning
-  scripted partials/endpoints), verifying segment finalization,
-  force-finalization on Stop, and UI state transitions — without touching
-  real audio or the ONNX model.
+- **Unit tests**: `TranscriptionSession` and `PauseDetector` are pure Kotlin
+  and tested with a fake `AudioCapture` (feeding canned PCM data) and a fake
+  `WhisperEngine` (returning scripted text per call), verifying segment
+  boundary detection, force-transcription on Stop, and UI state transitions
+  — without touching real audio or the actual model.
 - **Manual accuracy check**: run the app on a real Android device and a real
   iOS device, feed it a small set of German audio clips (general speech plus
   some medical terms — sourced or recorded as part of implementation, since
   no test set exists yet), and judge transcription quality by ear/eye.
-- **Success criteria**: the app builds and runs on both platforms, a live
-  transcript appears while speaking, and the output is subjectively "good
-  enough" German transcription. No formal accuracy metric (e.g. WER) is
-  required for this PoC.
+- **Success criteria**: the app builds and runs on both platforms, the
+  transcript grows in segments while speaking (per the "live-ish" behavior
+  defined in Goals), and the output is subjectively "good enough" German
+  transcription. No formal accuracy metric (e.g. WER) is required for this
+  PoC.
