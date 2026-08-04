@@ -22,6 +22,9 @@ out/
 ### Android / local machine config ###
 local.properties
 
+### Android native build (CMake/NDK external native build output) ###
+.cxx/
+
 ### Eclipse ###
 .apt_generated
 .classpath
