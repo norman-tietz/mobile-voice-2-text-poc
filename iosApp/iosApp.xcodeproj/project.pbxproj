@@ -9,10 +9,13 @@
 /* Begin PBXBuildFile section */
 		5060452D89EA5A166C45DC1A /* iOSApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 995439431AB2706B7B59BFE8 /* iOSApp.swift */; };
 		705FC7A7CC1547D68414F032 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EA764B65685B597BC2F9099 /* ContentView.swift */; };
+		AEB1D432CE2EB1F3141056AB /* ggml-small.bin in Resources */ = {isa = PBXBuildFile; fileRef = 74A54166EC30340FDD381283 /* ggml-small.bin */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		0483F71632672DDD0AB107E7 /* iosApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = iosApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		74A54166EC30340FDD381283 /* ggml-small.bin */ = {isa = PBXFileReference; lastKnownFileType = file; path = "Resources/ggml-small.bin"; sourceTree = "<group>"; };
+		8F2C6A1E4B3D5E7091ABCDE1 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		995439431AB2706B7B59BFE8 /* iOSApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = iOSApp.swift; sourceTree = "<group>"; };
 		9EA764B65685B597BC2F9099 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -49,6 +52,8 @@
 			children = (
 				995439431AB2706B7B59BFE8 /* iOSApp.swift */,
 				9EA764B65685B597BC2F9099 /* ContentView.swift */,
+				74A54166EC30340FDD381283 /* ggml-small.bin */,
+				8F2C6A1E4B3D5E7091ABCDE1 /* Info.plist */,
 			);
 			path = iosApp;
 			sourceTree = "<group>";
@@ -112,6 +117,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AEB1D432CE2EB1F3141056AB /* ggml-small.bin in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -276,21 +282,42 @@
 				DEVELOPMENT_TEAM = "";
 				ENABLE_PREVIEWS = YES;
 				FRAMEWORK_SEARCH_PATHS = "$(SRCROOT)/../composeApp/build/xcode-frameworks/$(CONFIGURATION)/$(SDK_NAME)";
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "This app needs microphone access to transcribe your speech.";
-				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
-				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = iosApp/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-sim/src/Release-iphonesimulator",
+					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-sim/ggml/src/Release-iphonesimulator",
+					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-sim/ggml/src/ggml-blas/Release-iphonesimulator",
+					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-sim/ggml/src/ggml-metal/Release-iphonesimulator",
+					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-device/src/Release-iphoneos",
+					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-device/ggml/src/Release-iphoneos",
+					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-device/ggml/src/ggml-blas/Release-iphoneos",
+					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-device/ggml/src/ggml-metal/Release-iphoneos",
 				);
 				MARKETING_VERSION = 1.0;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-framework",
 					ComposeApp,
+					"-lwhisper",
+					"-lggml",
+					"-lggml-cpu",
+					"-lggml-blas",
+					"-lggml-metal",
+					"-lggml-base",
+					"-framework",
+					Accelerate,
+					"-framework",
+					Metal,
+					"-framework",
+					MetalKit,
+					"-framework",
+					Foundation,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = ai.healthcarepoc.iosApp;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -309,21 +336,42 @@
 				DEVELOPMENT_TEAM = "";
 				ENABLE_PREVIEWS = YES;
 				FRAMEWORK_SEARCH_PATHS = "$(SRCROOT)/../composeApp/build/xcode-frameworks/$(CONFIGURATION)/$(SDK_NAME)";
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "This app needs microphone access to transcribe your speech.";
-				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
-				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = iosApp/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-sim/src/Release-iphonesimulator",
+					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-sim/ggml/src/Release-iphonesimulator",
+					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-sim/ggml/src/ggml-blas/Release-iphonesimulator",
+					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-sim/ggml/src/ggml-metal/Release-iphonesimulator",
+					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-device/src/Release-iphoneos",
+					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-device/ggml/src/Release-iphoneos",
+					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-device/ggml/src/ggml-blas/Release-iphoneos",
+					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-device/ggml/src/ggml-metal/Release-iphoneos",
 				);
 				MARKETING_VERSION = 1.0;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-framework",
 					ComposeApp,
+					"-lwhisper",
+					"-lggml",
+					"-lggml-cpu",
+					"-lggml-blas",
+					"-lggml-metal",
+					"-lggml-base",
+					"-framework",
+					Accelerate,
+					"-framework",
+					Metal,
+					"-framework",
+					MetalKit,
+					"-framework",
+					Foundation,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = ai.healthcarepoc.iosApp;
 				PRODUCT_NAME = "$(TARGET_NAME)";
