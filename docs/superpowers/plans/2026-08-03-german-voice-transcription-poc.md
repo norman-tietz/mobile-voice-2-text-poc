@@ -84,7 +84,11 @@ kotlin.code.style=official
 kotlin.mpp.enableCInteropCommonization=true
 android.useAndroidX=true
 org.gradle.jvmargs=-Xmx4096m
+android.builtInKotlin=false
+android.newDsl=false
 ```
+
+(The last two lines were not in the original spec but are required for AGP 9.1.1 + the Kotlin Multiplatform plugin to build together — confirmed by Task 1's implementation, which failed to build without them.)
 
 The `kotlin.mpp.enableCInteropCommonization` line matters for Task 6: the iOS cinterop binding to whisper.cpp is declared per-target (`iosX64`/`iosArm64`/`iosSimulatorArm64`) but consumed from the shared intermediate `iosMain` source set, which requires cinterop commonization to unify the three per-target `whispercinterop` klibs into one the shared source set can see.
 
