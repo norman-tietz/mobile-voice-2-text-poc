@@ -116,6 +116,14 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags += "-std=c++17"
+                // whisper.cpp/ggml are CPU-bound matrix-math code; without this, AGP's default
+                // CMake integration passes -DCMAKE_BUILD_TYPE=Debug for a debug Gradle variant,
+                // compiling them unoptimized (-O0). Measured effect: a single transcribe() call
+                // on well under 1 second of audio took 40+ seconds and counting on an unoptimized
+                // build. Force Release (-O2/-O3 + NDEBUG) for the native code regardless of the
+                // Kotlin/Gradle build variant - only the native inference speed matters here, not
+                // its own debuggability.
+                arguments += "-DCMAKE_BUILD_TYPE=Release"
             }
         }
     }

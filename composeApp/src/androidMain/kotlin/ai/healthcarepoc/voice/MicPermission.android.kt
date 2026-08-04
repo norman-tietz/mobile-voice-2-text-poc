@@ -13,10 +13,13 @@ actual class MicPermission actual constructor(private val context: ApplicationCo
     actual fun status(): PermissionStatus {
         val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
-        return if (granted) PermissionStatus.GRANTED else PermissionStatus.DENIED
+        val result = if (granted) PermissionStatus.GRANTED else PermissionStatus.DENIED
+        debugLog("MicPermission.status: $result")
+        return result
     }
 
     actual suspend fun request(): PermissionStatus = suspendCancellableCoroutine { continuation ->
+        debugLog("MicPermission.request: entered, requesting RECORD_AUDIO")
         PermissionRequestBridge.pendingContinuation = continuation
         context.requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), PermissionRequestBridge.REQUEST_CODE)
     }
@@ -34,6 +37,7 @@ object PermissionRequestBridge {
     var pendingContinuation: kotlinx.coroutines.CancellableContinuation<PermissionStatus>? = null
 
     fun onRequestPermissionsResult(requestCode: Int, grantResults: IntArray) {
+        debugLog("PermissionRequestBridge.onRequestPermissionsResult: requestCode=$requestCode grantResults=${grantResults.toList()} pendingContinuation=${if (pendingContinuation == null) "null" else "present"}")
         if (requestCode != REQUEST_CODE) return
         val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
         pendingContinuation?.resumeWith(
