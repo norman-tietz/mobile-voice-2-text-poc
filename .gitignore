@@ -55,3 +55,7 @@ DerivedData/
 
 ### Superpowers ###
 .superpowers/
+
+### Whisper model (downloaded by scripts/download-model.sh, not vendored) ###
+composeApp/src/androidMain/assets/models/*.bin
+iosApp/iosApp/Resources/*.bin
