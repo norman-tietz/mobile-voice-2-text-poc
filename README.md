@@ -95,13 +95,20 @@ cd mobile-voice-2-text-poc
 git submodule update --init
 
 ./scripts/download-model.sh
+./scripts/download-vad-model.sh
 ```
 
-The last step downloads the ~466 MiB German multilingual `ggml-small.bin`
+The first script downloads the ~466 MiB German multilingual `ggml-small.bin`
 model and places a copy at both platforms' expected asset locations
 (`composeApp/src/androidMain/assets/models/ggml-small.bin` and
 `iosApp/iosApp/Resources/ggml-small.bin`). The model is gitignored — every
 fresh checkout needs to run this script once.
+
+The second script downloads the small Silero VAD model
+(`ggml-silero-v6.2.0.bin`, a few MB) used for real-time speech/silence
+segmentation, and places a copy at both platforms' expected asset locations.
+It's also gitignored — run it once per fresh checkout, same as the model
+script above.
 
 ## Building & running — Android
 
