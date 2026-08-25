@@ -1167,6 +1167,12 @@ with:
                 debugLog("App.stopRecording: pipeline drained after ${nowMs() - t1}ms")
                 val t2 = nowMs()
                 activePipeline.session.stop()
+                // pipeline is reused (remember{}'d) across multiple Record/Stop cycles in the
+                // same app session, so the segmenter's buffer/VAD state must be cleared here -
+                // otherwise buffer grows unboundedly across recordings and the next recording's
+                // VAD trace starts contaminated by this one's tail, mirroring why session.stop()
+                // above resets the transcriber's context.
+                activePipeline.segmenter.reset()
                 val finalSegments = activePipeline.session.segments
                 if (finalSegments.size > whisperSegmentsShown) {
                     transcript = transcript + finalSegments.subList(whisperSegmentsShown, finalSegments.size)
