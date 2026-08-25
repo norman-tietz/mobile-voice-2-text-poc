@@ -54,6 +54,18 @@ AudioCapture (mic) → resampleTo16k → TranscriptionSession → PauseDetector
 Everything except the two native `WhisperEngine` bindings and the two
 `AudioCapture` bindings is shared Kotlin in `commonMain`.
 
+## Comparing against Android's native recognizer
+
+On Android only, a toggle next to the Record button switches between the
+Whisper pipeline above and Android's on-device `SpeechRecognizer`
+(`AndroidSpeechRecognizerEngine`), gated on
+`SpeechRecognizer.isOnDeviceRecognitionAvailable` (requires Android 12/API 31+)
+so it never falls back to cloud-based recognition. This exists purely to
+let the two engines' output be compared by ear on the same device — see
+`docs/superpowers/specs/2026-08-24-native-asr-comparison-design.md`. Each
+transcript line is prefixed with the engine that produced it
+(`[Whisper]`/`[Native]`). The toggle doesn't appear on iOS.
+
 ## Tech stack
 
 - Kotlin 2.4.10, Kotlin Multiplatform, Compose Multiplatform 1.11.1

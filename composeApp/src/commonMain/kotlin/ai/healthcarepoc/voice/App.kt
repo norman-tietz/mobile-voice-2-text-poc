@@ -3,9 +3,11 @@ package ai.healthcarepoc.voice
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -13,6 +15,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -30,6 +33,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 
+enum class AsrEngine { WHISPER, NATIVE }
+
 sealed interface UiState {
     data object Idle : UiState
     data object Recording : UiState
@@ -39,15 +44,28 @@ sealed interface UiState {
 }
 
 @Composable
+private fun EngineToggleButton(label: String, selected: Boolean, enabled: Boolean, onClick: () -> Unit) {
+    if (selected) {
+        Button(onClick = onClick, enabled = enabled) { Text(label) }
+    } else {
+        OutlinedButton(onClick = onClick, enabled = enabled) { Text(label) }
+    }
+}
+
+@Composable
 fun App(
     audioCapture: AudioCapture,
     micPermission: MicPermission,
     modelPathProvider: ModelPathProvider,
-    nativeSampleRateHz: () -> Int
+    nativeSampleRateHz: () -> Int,
+    nativeAsr: NativeAsrEngine? = null
 ) {
     var uiState by remember { mutableStateOf<UiState>(UiState.Idle) }
     var transcript by remember { mutableStateOf(listOf<String>()) }
     val scope = remember { CoroutineScope(Dispatchers.Default) }
+    var selectedEngine by remember { mutableStateOf(AsrEngine.WHISPER) }
+    var whisperSegmentsShown by remember { mutableStateOf(0) }
+    val nativeAvailable = remember(nativeAsr) { nativeAsr?.isAvailable() ?: false }
 
     // Loading the model can fail (missing/corrupt bundled file); session stays null
     // and an error state is shown instead of letting the app crash on first use.
@@ -70,49 +88,91 @@ fun App(
     // and performs acceptAudio()/transcribe() sequentially, off the capture thread.
     var audioChannel by remember { mutableStateOf<Channel<FloatArray>?>(null) }
     var consumerJob by remember { mutableStateOf<Job?>(null) }
+    var nativeStartJob by remember { mutableStateOf<Job?>(null) }
 
     fun startRecording() {
-        debugLog("App.startRecording: entered, session=${if (session == null) "null" else "ready"}")
-        val activeSession = session ?: return
-        uiState = UiState.Recording
-        val channel = Channel<FloatArray>(Channel.UNLIMITED)
-        audioChannel = channel
-        consumerJob = scope.launch {
-            for (samples in channel) {
-                activeSession.acceptAudio(samples)
-                transcript = activeSession.segments
+        debugLog("App.startRecording: entered, engine=$selectedEngine")
+        when (selectedEngine) {
+            AsrEngine.WHISPER -> {
+                val activeSession = session ?: return
+                uiState = UiState.Recording
+                val channel = Channel<FloatArray>(Channel.UNLIMITED)
+                audioChannel = channel
+                consumerJob = scope.launch {
+                    for (samples in channel) {
+                        activeSession.acceptAudio(samples)
+                        val allSegments = activeSession.segments
+                        if (allSegments.size > whisperSegmentsShown) {
+                            transcript = transcript + allSegments.subList(whisperSegmentsShown, allSegments.size)
+                                .map { "[Whisper] $it" }
+                            whisperSegmentsShown = allSegments.size
+                        }
+                    }
+                    debugLog("App: audio consumer loop exiting (channel closed)")
+                }
+                audioCapture.start { samples ->
+                    val resampled = resampleTo16k(samples, nativeSampleRateHz())
+                    val result = channel.trySend(resampled)
+                    if (result.isFailure) {
+                        debugLog("App: audioChannel.trySend failed (channel closed?): $result")
+                    }
+                }
+                debugLog("App.startRecording: audioCapture.start() returned, uiState=Recording")
             }
-            debugLog("App: audio consumer loop exiting (channel closed)")
-        }
-        audioCapture.start { samples ->
-            val resampled = resampleTo16k(samples, nativeSampleRateHz())
-            val result = channel.trySend(resampled)
-            if (result.isFailure) {
-                debugLog("App: audioChannel.trySend failed (channel closed?): $result")
+            AsrEngine.NATIVE -> {
+                val engine = nativeAsr ?: return
+                uiState = UiState.Recording
+                nativeStartJob = scope.launch {
+                    runCatching {
+                        engine.start(
+                            onSegment = { text -> transcript = transcript + "[Native] $text" },
+                            onError = { message -> uiState = UiState.Error(message) }
+                        )
+                    }.onFailure { e ->
+                        uiState = UiState.Error(e.message ?: "Native recognizer failed to start")
+                    }
+                }
+                debugLog("App.startRecording: nativeAsr.start() launched, uiState=Recording")
             }
         }
-        debugLog("App.startRecording: audioCapture.start() returned, uiState=Recording")
     }
 
     suspend fun stopRecording() {
-        debugLog("App.stopRecording: entered")
-        val activeSession = session ?: return
-        val t0 = nowMs()
-        audioCapture.stop()
-        debugLog("App.stopRecording: audioCapture.stop() returned after ${nowMs() - t0}ms")
-        // Close the channel and wait for the consumer to finish processing everything already
-        // queued (including any transcribe() call currently in flight) before force-finalizing
-        // the pending buffer - otherwise stop() could race the consumer and finalize a stale or
-        // incomplete pending buffer.
-        val t1 = nowMs()
-        audioChannel?.close()
-        consumerJob?.join()
-        audioChannel = null
-        consumerJob = null
-        debugLog("App.stopRecording: audio consumer drained after ${nowMs() - t1}ms")
-        val t2 = nowMs()
-        transcript = activeSession.stop()
-        debugLog("App.stopRecording: activeSession.stop() returned after ${nowMs() - t2}ms, segments=${transcript.size}")
+        debugLog("App.stopRecording: entered, engine=$selectedEngine")
+        when (selectedEngine) {
+            AsrEngine.WHISPER -> {
+                val activeSession = session ?: return
+                val t0 = nowMs()
+                audioCapture.stop()
+                debugLog("App.stopRecording: audioCapture.stop() returned after ${nowMs() - t0}ms")
+                // Close the channel and wait for the consumer to finish processing everything already
+                // queued (including any transcribe() call currently in flight) before force-finalizing
+                // the pending buffer - otherwise stop() could race the consumer and finalize a stale or
+                // incomplete pending buffer.
+                val t1 = nowMs()
+                audioChannel?.close()
+                consumerJob?.join()
+                audioChannel = null
+                consumerJob = null
+                debugLog("App.stopRecording: audio consumer drained after ${nowMs() - t1}ms")
+                val t2 = nowMs()
+                val finalSegments = activeSession.stop()
+                if (finalSegments.size > whisperSegmentsShown) {
+                    transcript = transcript + finalSegments.subList(whisperSegmentsShown, finalSegments.size)
+                        .map { "[Whisper] $it" }
+                    whisperSegmentsShown = finalSegments.size
+                }
+                debugLog("App.stopRecording: activeSession.stop() returned after ${nowMs() - t2}ms, segments=${finalSegments.size}")
+            }
+            AsrEngine.NATIVE -> {
+                val engine = nativeAsr ?: return
+                nativeStartJob?.join()
+                nativeStartJob = null
+                val t0 = nowMs()
+                engine.stop()
+                debugLog("App.stopRecording: nativeAsr.stop() returned after ${nowMs() - t0}ms")
+            }
+        }
         uiState = UiState.Idle
         debugLog("App.stopRecording: uiState=Idle")
     }
@@ -181,7 +241,7 @@ fun App(
 
     MaterialTheme {
         Column(
-            modifier = Modifier.fillMaxSize().padding(16.dp),
+            modifier = Modifier.fillMaxSize().safeDrawingPadding().padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
@@ -206,6 +266,20 @@ fun App(
             }
 
             if (uiState !is UiState.PermissionDenied && uiState !is UiState.Error) {
+                if (nativeAsr != null) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally)
+                    ) {
+                        val toggleEnabled = uiState == UiState.Idle
+                        EngineToggleButton("Whisper", selectedEngine == AsrEngine.WHISPER, toggleEnabled) {
+                            selectedEngine = AsrEngine.WHISPER
+                        }
+                        EngineToggleButton("Native", selectedEngine == AsrEngine.NATIVE, toggleEnabled && nativeAvailable) {
+                            selectedEngine = AsrEngine.NATIVE
+                        }
+                    }
+                }
                 Box(
                     modifier = Modifier.fillMaxWidth().padding(bottom = 24.dp),
                     contentAlignment = Alignment.Center
