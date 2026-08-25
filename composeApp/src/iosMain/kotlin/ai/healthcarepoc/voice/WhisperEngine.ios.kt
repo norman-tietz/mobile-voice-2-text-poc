@@ -1,12 +1,16 @@
 package ai.healthcarepoc.voice
 
 import kotlinx.cinterop.ExperimentalForeignApi
+import kotlinx.cinterop.IntVar
 import kotlinx.cinterop.addressOf
+import kotlinx.cinterop.allocArray
 import kotlinx.cinterop.cstr
+import kotlinx.cinterop.get
 import kotlinx.cinterop.memScoped
 import kotlinx.cinterop.pointed
 import kotlinx.cinterop.ptr
 import kotlinx.cinterop.readValue
+import kotlinx.cinterop.set
 import kotlinx.cinterop.toKString
 import kotlinx.cinterop.usePinned
 import platform.Foundation.NSProcessInfo
@@ -14,7 +18,9 @@ import whispercinterop.whisper_context_default_params
 import whispercinterop.whisper_full
 import whispercinterop.whisper_full_default_params
 import whispercinterop.whisper_full_get_segment_text
+import whispercinterop.whisper_full_get_token_id
 import whispercinterop.whisper_full_n_segments
+import whispercinterop.whisper_full_n_tokens
 import whispercinterop.whisper_free
 import whispercinterop.whisper_init_from_file_with_params
 import whispercinterop.whisper_n_audio_ctx
@@ -30,6 +36,11 @@ actual class WhisperEngine actual constructor(modelPath: String) : Transcriber {
         whisper_init_from_file_with_params(modelPath, whisper_context_default_params())
             ?: error("Failed to load Whisper model at $modelPath")
     }
+
+    // Previous segment's decoded tokens, fed back in as wparams.prompt_tokens on the
+    // next transcribe() call (whisper.cpp's "condition on previous text" pattern) so a
+    // pause-triggered chunk isn't decoded in isolation from what was just said.
+    private var prevTokens: List<Int> = emptyList()
 
     actual override fun transcribe(samples: FloatArray): String = memScoped {
         // whisper_full_default_params returns the struct by value (CValue<whisper_full_params>).
@@ -51,6 +62,12 @@ actual class WhisperEngine actual constructor(modelPath: String) : Transcriber {
         params.print_realtime = false
         params.n_threads = max(1, NSProcessInfo.processInfo.activeProcessorCount.toInt())
         params.max_tokens = 224
+        if (prevTokens.isNotEmpty()) {
+            val promptArray = allocArray<IntVar>(prevTokens.size)
+            prevTokens.forEachIndexed { index, token -> promptArray[index] = token }
+            params.prompt_tokens = promptArray
+            params.prompt_n_tokens = prevTokens.size
+        }
 
         // Left at its default (0), audio_ctx makes whisper.cpp always encode the
         // model's full 30s/1500-frame context no matter how short the input is, so
@@ -74,11 +91,27 @@ actual class WhisperEngine actual constructor(modelPath: String) : Transcriber {
         }
 
         val segmentCount = whisper_full_n_segments(ctx)
-        buildString {
+        val text = buildString {
             for (i in 0 until segmentCount) {
                 append(whisper_full_get_segment_text(ctx, i)?.toKString())
             }
         }
+
+        prevTokens = buildList {
+            for (i in 0 until segmentCount) {
+                val tokenCount = whisper_full_n_tokens(ctx, i)
+                for (j in 0 until tokenCount) {
+                    add(whisper_full_get_token_id(ctx, i, j))
+                }
+            }
+        }
+
+        text
+    }
+
+    override fun resetContext() {
+        debugLog("WhisperEngine.resetContext: clearing carried-over prompt tokens")
+        prevTokens = emptyList()
     }
 
     actual fun release() {

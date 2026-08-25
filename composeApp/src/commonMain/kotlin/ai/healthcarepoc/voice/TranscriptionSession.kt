@@ -2,6 +2,11 @@ package ai.healthcarepoc.voice
 
 interface Transcriber {
     fun transcribe(samples: FloatArray): String
+
+    // Clears any decoding context carried over between transcribe() calls (e.g. prior
+    // segment tokens used as a prompt), so the next recording session starts blind
+    // instead of being biased by the previous session's tail.
+    fun resetContext()
 }
 
 class TranscriptionSession(
@@ -27,6 +32,7 @@ class TranscriptionSession(
         if (pendingSamples.isNotEmpty()) {
             finalizeSegment()
         }
+        transcriber.resetContext()
         debugLog("TranscriptionSession.stop: returning ${segments.size} segments")
         return segments
     }

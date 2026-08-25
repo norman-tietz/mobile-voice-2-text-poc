@@ -5,9 +5,13 @@ import kotlin.test.assertEquals
 
 private class FakeTranscriber(private val responses: MutableList<String>) : Transcriber {
     val callArgs = mutableListOf<FloatArray>()
+    var resetContextCalls = 0
     override fun transcribe(samples: FloatArray): String {
         callArgs.add(samples)
         return responses.removeAt(0)
+    }
+    override fun resetContext() {
+        resetContextCalls++
     }
 }
 
@@ -64,6 +68,17 @@ class TranscriptionSessionTest {
 
         assertEquals(listOf("letzter satz"), result)
         assertEquals(listOf("letzter satz"), session.segments)
+    }
+
+    @Test
+    fun `stop resets the transcriber context so the next session starts blind`() {
+        val transcriber = FakeTranscriber(mutableListOf("letzter satz"))
+        val session = TranscriptionSession(transcriber, PauseDetector(sampleRate, minSilenceDurationMs = 700))
+
+        session.acceptAudio(chunk(100, 0.5f))
+        session.stop()
+
+        assertEquals(1, transcriber.resetContextCalls)
     }
 
     @Test

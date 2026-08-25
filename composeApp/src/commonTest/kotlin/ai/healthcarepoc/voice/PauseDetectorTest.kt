@@ -42,6 +42,16 @@ class PauseDetectorTest {
     }
 
     @Test
+    fun `default threshold requires 1500ms of trailing silence`() {
+        val detector = PauseDetector(sampleRate)
+        assertFalse(detector.accept(loudChunk(100)))
+        // 1400ms of silence: not yet a pause at the new, longer default.
+        repeat(14) { assertFalse(detector.accept(silentChunk(100))) }
+        // 15th 100ms chunk crosses the 1500ms default threshold.
+        assertTrue(detector.accept(silentChunk(100)))
+    }
+
+    @Test
     fun `reset clears trailing silence tracking`() {
         val detector = PauseDetector(sampleRate, minSilenceDurationMs = 700)
         repeat(6) { detector.accept(silentChunk(100)) }

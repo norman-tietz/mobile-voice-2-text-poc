@@ -5,7 +5,7 @@ import kotlin.math.sqrt
 class PauseDetector(
     private val sampleRateHz: Int,
     private val silenceThresholdRms: Float = 0.02f,
-    private val minSilenceDurationMs: Int = 700
+    private val minSilenceDurationMs: Int = 1500
 ) {
     private var trailingSilenceMs: Int = 0
 

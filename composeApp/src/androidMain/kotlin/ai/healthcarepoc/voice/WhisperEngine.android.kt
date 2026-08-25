@@ -22,8 +22,14 @@ actual class WhisperEngine actual constructor(modelPath: String) : Transcriber {
         nativeRelease(handle)
     }
 
+    override fun resetContext() {
+        debugLog("WhisperEngine.resetContext: clearing carried-over prompt tokens")
+        nativeResetContext(handle)
+    }
+
     private external fun nativeInit(modelPath: String): Long
     private external fun nativeTranscribe(handle: Long, samples: FloatArray): String
+    private external fun nativeResetContext(handle: Long)
     private external fun nativeRelease(handle: Long)
 
     companion object {
