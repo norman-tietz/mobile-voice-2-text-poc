@@ -98,7 +98,15 @@ fun App(
     val pipeline = remember {
         runCatching {
             val engine = WhisperEngine(modelPathProvider.resolveModelPath())
-            val vad = WhisperVad(modelPathProvider.resolveVadModelPath())
+            // If WhisperVad's init throws, engine is already holding a native context - release
+            // it here rather than letting it leak, since pipeline (and the DisposableEffect that
+            // would otherwise release it) never gets constructed in that case.
+            val vad = try {
+                WhisperVad(modelPathProvider.resolveVadModelPath())
+            } catch (e: Throwable) {
+                engine.release()
+                throw e
+            }
             WhisperPipeline(TranscriptionSession(engine), SpeechSegmenter(vad, sampleRateHz = 16_000), engine, vad)
         }.onFailure { e ->
             uiState = UiState.Error(e.message ?: "Failed to load speech model")

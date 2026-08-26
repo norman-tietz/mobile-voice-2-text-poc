@@ -10,6 +10,12 @@ class SpeechSegmenter(
     private val vad: VoiceActivityDetector,
     private val sampleRateHz: Int,
     private val minSilenceDurationMs: Int = 500,
+    // Hard cap on a single buffered run, independent of the negThreshold/threshold hysteresis
+    // below. Sustained ambient noise (HVAC, café, corridor chatter) can sit in the ambiguous
+    // band [negThreshold, threshold) indefinitely, in which case trailingSilenceMs never
+    // advances and neither hysteresis branch ever fires - without this cap pendingSamples would
+    // grow for the entire recording. 30s also matches whisper.cpp's own context window.
+    private val maxSegmentDurationMs: Int = 30_000,
     private val threshold: Float = 0.5f,
     // Confirmed on-device (2026-08-26): whisper.cpp's own 0.35 default, tuned for its
     // whole-file batch analysis, is too easily satisfied by per-100ms-chunk classification -
@@ -19,7 +25,12 @@ class SpeechSegmenter(
     // confident are silent count toward the pause timer.
     private val negThreshold: Float = 0.15f
 ) {
-    private val pendingSamples = mutableListOf<Float>()
+    // Chunks are accumulated by reference and concatenated into one FloatArray only at
+    // finalize() - a mutableListOf<Float> would box every sample twice per chunk (once via
+    // toList(), once into the ArrayList's backing array) on this coroutine's hot path, which is
+    // explicitly documented (see consumerJob in App.kt) as needing to never fall behind.
+    private val pendingChunks = mutableListOf<FloatArray>()
+    private var pendingSampleCount = 0
 
     // Whether any chunk in the current pending buffer crossed `threshold`. Doubles as "is the
     // current run in speech" - a silence period that never had real speech in it is dropped
@@ -31,7 +42,8 @@ class SpeechSegmenter(
     // Feed one capture chunk. Returns a finalized segment if a speech run just ended
     // (minSilenceDurationMs of trailing below-negThreshold audio), else empty.
     fun accept(samples: FloatArray): List<FloatArray> {
-        pendingSamples.addAll(samples.toList())
+        pendingChunks.add(samples)
+        pendingSampleCount += samples.size
         val prob = vad.speechProbability(samples)
         val chunkDurationMs = (samples.size * 1000) / sampleRateHz
 
@@ -42,20 +54,21 @@ class SpeechSegmenter(
             trailingSilenceMs += chunkDurationMs
         }
         // between negThreshold and threshold: ambiguous chunk, leave trailingSilenceMs as-is
+        val bufferedDurationMs = (pendingSampleCount * 1000) / sampleRateHz
         debugLog(
             "SpeechSegmenter.accept: prob=$prob, inSpeech=$inSpeech, " +
-                "trailingSilenceMs=$trailingSilenceMs, pendingSamples=${pendingSamples.size}"
+                "trailingSilenceMs=$trailingSilenceMs, pendingSamples=$pendingSampleCount"
         )
 
-        if (inSpeech && trailingSilenceMs >= minSilenceDurationMs) {
-            debugLog("SpeechSegmenter.accept: trailing silence threshold reached, finalizing segment")
+        if (inSpeech && (trailingSilenceMs >= minSilenceDurationMs || bufferedDurationMs >= maxSegmentDurationMs)) {
+            debugLog("SpeechSegmenter.accept: trailing silence threshold or max duration reached, finalizing segment")
             return finalize()
         }
-        if (!inSpeech && trailingSilenceMs >= minSilenceDurationMs) {
-            // Long silence before any speech started - drop it so pendingSamples doesn't
-            // grow unboundedly while nothing is being said.
+        if (!inSpeech && (trailingSilenceMs >= minSilenceDurationMs || bufferedDurationMs >= maxSegmentDurationMs)) {
+            // Long silence, or long ambiguous-but-never-speech noise, before any speech started -
+            // drop it so pendingSamples doesn't grow unboundedly while nothing is being said.
             debugLog("SpeechSegmenter.accept: dropping silence-only buffer (no speech yet)")
-            pendingSamples.clear()
+            clearPending()
             trailingSilenceMs = 0
         }
         return emptyList()
@@ -75,10 +88,15 @@ class SpeechSegmenter(
     // Clears state between recordings.
     fun reset() {
         debugLog("SpeechSegmenter.reset: clearing buffer/VAD state")
-        pendingSamples.clear()
+        clearPending()
         inSpeech = false
         trailingSilenceMs = 0
         vad.resetState()
+    }
+
+    private fun clearPending() {
+        pendingChunks.clear()
+        pendingSampleCount = 0
     }
 
     private fun finalize(): List<FloatArray> {
@@ -89,11 +107,16 @@ class SpeechSegmenter(
         trailingSilenceMs = 0
         if (!wasInSpeech) {
             debugLog("SpeechSegmenter.finalize: no speech in pending buffer, dropping it")
-            pendingSamples.clear()
+            clearPending()
             return emptyList()
         }
-        val segment = pendingSamples.toFloatArray()
-        pendingSamples.clear()
+        val segment = FloatArray(pendingSampleCount)
+        var offset = 0
+        for (chunk in pendingChunks) {
+            chunk.copyInto(segment, offset)
+            offset += chunk.size
+        }
+        clearPending()
         debugLog("SpeechSegmenter.finalize: emitting segment of ${segment.size} samples")
         return listOf(segment)
     }

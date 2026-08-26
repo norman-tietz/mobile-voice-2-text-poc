@@ -58,13 +58,16 @@ class AndroidSpeechRecognizerEngine(private val context: Context) : NativeAsrEng
         val completed = withTimeoutOrNull(5_000) {
             deferred.await()
         }
-        if (completed == null) {
-            debugLog("AndroidSpeechRecognizerEngine.stop: timeout waiting for recognizer callback")
-            withContext(Dispatchers.Main) {
+        // stopSignal must be cleared in the same Main continuation that tears down the
+        // callbacks below - splitting these into separate withContext blocks yields the Main
+        // dispatcher in between, leaving a window where a late RecognitionListener callback
+        // sees stopSignal == null and active == false but segmentCallback/errorCallback still
+        // set, and invokes them after stop() has already returned.
+        withContext(Dispatchers.Main) {
+            if (completed == null) {
+                debugLog("AndroidSpeechRecognizerEngine.stop: timeout waiting for recognizer callback")
                 stopSignal = null
             }
-        }
-        withContext(Dispatchers.Main) {
             recognizer?.destroy()
             recognizer = null
             segmentCallback = null

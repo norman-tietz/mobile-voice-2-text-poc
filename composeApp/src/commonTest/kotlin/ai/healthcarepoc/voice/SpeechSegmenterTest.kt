@@ -57,7 +57,7 @@ class SpeechSegmenterTest {
 
     @Test
     fun `stays in speech through an ambiguous chunk between negThreshold and threshold`() {
-        // 0.9 enters speech; 0.4 is between negThreshold(0.35) and threshold(0.5) - must NOT
+        // 0.9 enters speech; 0.4 is between negThreshold(0.15) and threshold(0.5) - must NOT
         // count as silence and must NOT exit speech; trailing silence still needs the full
         // duration counted only from genuinely low-probability chunks afterward.
         val vad = FakeVad((mutableListOf(0.9f, 0.4f) + List(7) { 0.1f }).toMutableList())
@@ -70,6 +70,39 @@ class SpeechSegmenterTest {
         var result: List<FloatArray> = emptyList()
         repeat(7) { result = segmenter.accept(chunk(0.0f)) }
         assertEquals(1, result.size)
+    }
+
+    @Test
+    fun `forces a finalize once buffered duration hits the cap, even with no trailing silence`() {
+        // All chunks after entry stay ambiguous (0.4 is between negThreshold and threshold), so
+        // trailingSilenceMs never advances - only the duration cap can end this run.
+        val vad = FakeVad((mutableListOf(0.9f) + List(10) { 0.4f }).toMutableList())
+        val segmenter = SpeechSegmenter(
+            vad, sampleRate, minSilenceDurationMs = 10_000, maxSegmentDurationMs = 500
+        )
+
+        segmenter.accept(chunk(1.0f)) // 0.9 -> enters speech, 100ms buffered
+        var result: List<FloatArray> = emptyList()
+        repeat(4) { result = segmenter.accept(chunk(1.0f)) } // +400ms ambiguous = 500ms buffered
+
+        assertEquals(1, result.size)
+        assertEquals(5 * 1600, result[0].size)
+    }
+
+    @Test
+    fun `drops a pre-speech buffer once it hits the duration cap, without ever entering speech`() {
+        // Ambiguous the whole time (never crosses threshold, never drops below negThreshold), so
+        // trailingSilenceMs never advances - only the duration cap can drop this buffer.
+        val vad = FakeVad(MutableList(10) { 0.4f })
+        val segmenter = SpeechSegmenter(
+            vad, sampleRate, minSilenceDurationMs = 10_000, maxSegmentDurationMs = 500
+        )
+
+        var sawSegment = false
+        repeat(5) { if (segmenter.accept(chunk(0.4f)).isNotEmpty()) sawSegment = true }
+
+        assertEquals(false, sawSegment)
+        assertNull(segmenter.flush())
     }
 
     @Test
