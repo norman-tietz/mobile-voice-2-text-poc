@@ -51,6 +51,111 @@ diagnose this). Key observations:
   was eventually transcribed — confirming this is a timing/segmentation
   defect, not data loss in capture.
 
+## Correction (2026-08-26)
+
+The original version of this spec (below, largely unchanged) assumed
+`whisper_vad_detect_speech_no_reset()` + repeated `whisper_vad_segments_from_probs()`
+calls would let segment boundaries accumulate across calls as audio streamed
+in — the same "condition on previous output" shape as the token-carryover
+work elsewhere in this codebase. That assumption was implemented (Tasks
+3/4/5/6/8) and reached final review before ever running on a real device —
+the flagged spike ("Implementation risk to verify early" below) never
+happened, because no Android device was reachable for the entire
+implementation session. The final whole-branch review caught it instead,
+and it was independently confirmed against the whisper.cpp source rather
+than taken on faith:
+
+- `whisper_vad_detect_speech_no_reset()` does `vctx->probs.resize(n_chunks)`
+  (`whisper.cpp:5116`) — it **overwrites** the VAD context's probability
+  buffer with only the current call's chunk. "no_reset" preserves the
+  model's recurrent hidden state, not the probability trace
+  `whisper_vad_segments_from_probs()` reads. With capture-sized (100ms)
+  chunks, `whisper_vad_n_probs()` would only ever cover ~100ms per call —
+  below whisper.cpp's own default 250ms minimum speech duration — so
+  `segments()` would return empty essentially always in real use.
+- `whisper_vad_segments_from_probs()` also returns the still-open trailing
+  segment if the buffer ends mid-speech (`whisper.cpp:5343-5346`, "Handle
+  the case if we're still in a speech segment at the end") — contradicting
+  the "only appears once closed" contract the original interface below
+  documented.
+- Checked for precedent across the whole whisper.cpp tree: `tests/test-vad.cpp`
+  only calls `whisper_vad_detect_speech()` once over a *whole* file before
+  deriving segments from that one call; `examples/stream/stream.cpp` (the
+  project's own live-mic streaming example) doesn't use `whisper_vad_*` at
+  all — its `--vad` mode uses a separate, older, simple energy-based
+  `vad_simple()` heuristic instead. Nothing in the codebase demonstrates the
+  incremental-accumulation usage this plan assumed.
+
+**The corrected pattern:** use whisper_vad as a real-time per-chunk
+speech/silence *classifier*, not a segment-boundary deriver. Call `feed()`,
+then immediately read `whisper_vad_probs()`/`whisper_vad_n_probs()` for that
+chunk's probability (correctly informed by every prior chunk via the
+preserved hidden state) — and keep the trailing-silence-duration bookkeeping
+in Kotlin, the same shape the old `PauseDetector` already had, just with VAD
+probability replacing RMS energy as the per-chunk signal.
+`whisper_vad_segments_from_probs()` and its params (`min_silence_duration_ms`,
+`speech_pad_ms`, etc.) drop out of the design entirely — every mention of
+them in the sections below is superseded by the **Components (corrected)**
+section, which replaces the original **Components** section's
+`VoiceActivityDetector`/`WhisperVad`/`SpeechSegmenter` subsections. The
+architecture diagram, the two-stage pipeline, and everything else in this
+spec is unaffected — the fix in this section is *smaller* than the original
+design, not larger, since it never depended on the broken assumption.
+
+## Components (corrected)
+
+**`VoiceActivityDetector`** (replaces the original interface below):
+
+```kotlin
+interface VoiceActivityDetector {
+    // Classifies one capture chunk as speech or not, informed by every
+    // chunk fed before it (the model's recurrent state carries forward
+    // across calls even though its probability output does not).
+    fun isSpeech(samples: FloatArray): Boolean
+    fun resetState()
+}
+```
+
+**`WhisperVad`** (replaces the original description below): wraps
+`whisper_vad_context`, loaded from the bundled VAD model at startup
+alongside the ASR model. `isSpeech()` calls
+`whisper_vad_detect_speech_no_reset()` on exactly the given chunk, then
+reads `whisper_vad_probs()`/`whisper_vad_n_probs()` immediately (before the
+next call overwrites them) and returns `true` if any of that chunk's
+sub-window probabilities meet whisper.cpp's default `threshold` (0.5, from
+`whisper_vad_default_params()`) — a chunk this size (100ms) may span
+multiple of the model's native windows, so "any window over threshold"
+rather than an average avoids diluting a short loud syllable inside an
+otherwise-quiet chunk. `whisper_vad_segments_from_probs()` is not called at
+all in the corrected design.
+
+**`SpeechSegmenter`** (replaces the original description below): now owns
+the trailing-silence-duration state machine itself (feed a chunk to
+`vad.isSpeech()`, accumulate `trailingSilenceMs`, cut when it crosses
+`minSilenceDurationMs`) — structurally the same shape as the old
+`PauseDetector`, including a `hadSpeech`-equivalent guard so `flush()`
+doesn't hand a purely-silent trailing buffer to `transcribe()` (this also
+supersedes the **Removed** section's claim that the hallucination guard is
+"structurally unnecessary" — with the corrected design it's necessary
+again, just re-implemented against VAD probability instead of RMS). Public
+signature (`accept(samples): List<FloatArray>`, `flush(): FloatArray?`)
+stays the same as the original design below, so nothing in `App.kt`'s
+wiring needs to change — only `SpeechSegmenter`'s internals and the
+`VoiceActivityDetector` contract underneath it do.
+
+**Also found during final review, unrelated to the calling-pattern bug, both addressed alongside this correction:**
+- The VAD model file is copied to `iosApp/iosApp/Resources/` by the
+  download script, but was never added to `project.pbxproj`'s Resources
+  build phase — Xcode doesn't bundle files just for existing on disk in a
+  referenced folder. `resolveVadModelPath()` would throw on iOS at runtime.
+  Needs a `PBXBuildFile`/`PBXFileReference` entry mirroring `ggml-small.bin`'s
+  existing ones.
+- Native handles (`WhisperEngine`, `WhisperVad`) are never `release()`'d in
+  production code, only from instrumented tests — pre-existing for
+  `WhisperEngine` (predates this plan), now doubled up with `WhisperVad`.
+  `App.kt`'s `pipeline` `remember{}` needs a `DisposableEffect`/`onDispose`
+  releasing both.
+
 ## Goals
 
 - Segment boundaries reflect when the user actually paused, regardless of
@@ -114,7 +219,7 @@ Transcriber can lag behind arbitrarily (as it already does today) without
 corrupting *where* segments got cut — it only affects how soon a correctly-
 cut segment's text appears.
 
-## Components
+## Components (original — superseded, kept for history; see "Components (corrected)" above)
 
 **`VoiceActivityDetector`** (new, `commonMain` interface — kept thin and
 fakeable so the segmentation policy stays unit-testable without a real VAD
@@ -145,7 +250,8 @@ clipping word edges, `min_speech_duration_ms=250` to reject spurious blips)
 sourced from `whisper_vad_default_params()`. JNI additions mirror the
 pattern in `whisper_jni.cpp`; iOS additions mirror `WhisperEngine.ios.kt`.
 
-**Implementation risk to verify early** (spike before building the full
+**Implementation risk to verify early — CONFIRMED FALSE, see "Correction (2026-08-26)" above.**
+(spike before building the full
 pipeline on top of it): confirm on-device, with a short real recording, that
 segments only appear via `segments()` once actually closed by trailing
 silence — not partially/speculatively while still open. The `whisper.cpp`
