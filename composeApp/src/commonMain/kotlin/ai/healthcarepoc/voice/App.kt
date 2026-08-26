@@ -91,6 +91,7 @@ fun App(
     var selectedEngine by remember { mutableStateOf(AsrEngine.WHISPER) }
     var whisperSegmentsShown by remember { mutableStateOf(0) }
     val nativeAvailable = remember(nativeAsr) { nativeAsr?.isAvailable() ?: false }
+    KeepScreenOn(enabled = uiState == UiState.Recording)
 
     // Loading either model can fail (missing/corrupt bundled file); pipeline stays null
     // and an error state is shown instead of letting the app crash on first use.
