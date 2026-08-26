@@ -1,18 +1,18 @@
 package ai.healthcarepoc.voice
 
-// Thin seam over whisper.cpp's streaming VAD (whisper_vad_detect_speech_no_reset +
-// whisper_vad_segments_from_probs) so the segmentation policy (SpeechSegmenter) can be
-// unit-tested against a fake, without needing the real VAD model.
+// Thin seam over whisper.cpp's VAD so the segmentation policy (SpeechSegmenter) can be
+// unit-tested against a fake, without needing the real VAD model. whisper_vad_* does not
+// support accumulating a probability trace across calls - each call to
+// whisper_vad_detect_speech_no_reset() overwrites the context's probability buffer with
+// only that call's chunk (see docs/superpowers/specs/2026-08-25-vad-segmentation-design.md,
+// "Correction" section) - so this is a per-chunk classifier, not a segment-boundary deriver.
+// The model's recurrent hidden state does carry forward across calls even though the
+// probability output doesn't, so results are still informed by everything fed before.
 interface VoiceActivityDetector {
-    // Feed newly captured samples; appends to the VAD's running trace.
-    fun feed(samples: FloatArray)
-
-    // Segment boundaries (seconds, relative to the last resetState() call) that can
-    // currently be derived from everything fed so far. A segment only appears once its
-    // end has been determined by minSilenceDurationMs of trailing low-probability audio
-    // - the in-progress trailing segment (still being spoken) does not appear until it
-    // closes.
-    fun segments(minSilenceDurationMs: Int): List<ClosedFloatingPointRange<Float>>
+    // Speech probability [0, 1] for one capture chunk - the max across the chunk's
+    // sub-windows, not an average, so a short loud syllable in an otherwise-quiet chunk
+    // isn't diluted away.
+    fun speechProbability(samples: FloatArray): Float
 
     // Clears VAD state between recordings.
     fun resetState()

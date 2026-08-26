@@ -8,13 +8,8 @@ actual class WhisperVad actual constructor(modelPath: String) : VoiceActivityDet
         result
     }
 
-    actual override fun feed(samples: FloatArray) {
-        nativeFeed(handle, samples)
-    }
-
-    actual override fun segments(minSilenceDurationMs: Int): List<ClosedFloatingPointRange<Float>> {
-        val flat = nativeSegments(handle, minSilenceDurationMs)
-        return (flat.indices step 2).map { i -> flat[i]..flat[i + 1] }
+    actual override fun speechProbability(samples: FloatArray): Float {
+        return nativeSpeechProbability(handle, samples)
     }
 
     actual override fun resetState() {
@@ -26,8 +21,7 @@ actual class WhisperVad actual constructor(modelPath: String) : VoiceActivityDet
     }
 
     private external fun nativeInit(modelPath: String): Long
-    private external fun nativeFeed(handle: Long, samples: FloatArray)
-    private external fun nativeSegments(handle: Long, minSilenceDurationMs: Int): FloatArray
+    private external fun nativeSpeechProbability(handle: Long, samples: FloatArray): Float
     private external fun nativeResetState(handle: Long)
     private external fun nativeRelease(handle: Long)
 

@@ -14,38 +14,30 @@ Java_ai_healthcarepoc_voice_WhisperVad_nativeInit(JNIEnv *env, jobject /*thiz*/,
     return reinterpret_cast<jlong>(vctx);
 }
 
-extern "C" JNIEXPORT void JNICALL
-Java_ai_healthcarepoc_voice_WhisperVad_nativeFeed(JNIEnv *env, jobject /*thiz*/, jlong handle, jfloatArray samples) {
+// Classifies exactly the given chunk as speech/non-speech. whisper_vad_detect_speech_no_reset
+// overwrites the VAD context's probability buffer with only this call's chunk each time - it
+// does NOT accumulate across calls. Only the model's recurrent hidden state carries forward,
+// which is what makes repeated per-chunk calls meaningfully informed by prior audio despite the
+// probability buffer itself being call-local. So the probabilities must be read back
+// immediately after detect_speech_no_reset(), before the next call overwrites them.
+extern "C" JNIEXPORT jfloat JNICALL
+Java_ai_healthcarepoc_voice_WhisperVad_nativeSpeechProbability(JNIEnv *env, jobject /*thiz*/, jlong handle, jfloatArray samples) {
     auto *vctx = reinterpret_cast<struct whisper_vad_context *>(handle);
     jsize n = env->GetArrayLength(samples);
     std::vector<float> buffer(n);
     env->GetFloatArrayRegion(samples, 0, n, buffer.data());
-    whisper_vad_detect_speech_no_reset(vctx, buffer.data(), static_cast<int>(buffer.size()));
-}
 
-// Returns a flattened [t0_0, t1_0, t0_1, t1_1, ...] array, one (t0, t1) pair per closed
-// segment, in seconds - matches how WhisperVad.android.kt's segments() unpacks it.
-extern "C" JNIEXPORT jfloatArray JNICALL
-Java_ai_healthcarepoc_voice_WhisperVad_nativeSegments(JNIEnv *env, jobject /*thiz*/, jlong handle, jint minSilenceDurationMs) {
-    auto *vctx = reinterpret_cast<struct whisper_vad_context *>(handle);
-
-    struct whisper_vad_params params = whisper_vad_default_params();
-    params.min_silence_duration_ms = minSilenceDurationMs;
-
-    struct whisper_vad_segments *segments = whisper_vad_segments_from_probs(vctx, params);
-    int n = whisper_vad_segments_n_segments(segments);
-
-    std::vector<float> flat;
-    flat.reserve(static_cast<size_t>(n) * 2);
-    for (int i = 0; i < n; ++i) {
-        flat.push_back(whisper_vad_segments_get_segment_t0(segments, i));
-        flat.push_back(whisper_vad_segments_get_segment_t1(segments, i));
+    if (!whisper_vad_detect_speech_no_reset(vctx, buffer.data(), static_cast<int>(buffer.size()))) {
+        return 0.0f;
     }
-    whisper_vad_free_segments(segments);
 
-    jfloatArray result = env->NewFloatArray(static_cast<jsize>(flat.size()));
-    env->SetFloatArrayRegion(result, 0, static_cast<jsize>(flat.size()), flat.data());
-    return result;
+    const int n_probs = whisper_vad_n_probs(vctx);
+    const float *probs = whisper_vad_probs(vctx);
+    float max_prob = 0.0f;
+    for (int i = 0; i < n_probs; ++i) {
+        max_prob = std::max(max_prob, probs[i]);
+    }
+    return max_prob;
 }
 
 extern "C" JNIEXPORT void JNICALL
