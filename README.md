@@ -182,13 +182,6 @@ docs/superpowers/      design doc and implementation plan
 
 ## Known limitations (PoC scope)
 
-- **No `CMAKE_BUILD_TYPE` is set for the Android native build**, so debug
-  builds compile whisper.cpp unoptimized; transcription can be very slow
-  (tens of seconds to minutes per segment) on a debug APK. This is under
-  active investigation (see `[VoiceDebug]`-tagged Logcat output).
-- Audio capture briefly blocks while a segment is transcribing (the
-  pipeline is synchronous), so speech immediately after a pause can be
-  dropped until inference finishes.
 - iOS Simulator cannot run whisper.cpp's GPU/Metal backend for this model
   size (a Simulator-only `MTLSimDevice` limitation); real devices are
   unaffected.
