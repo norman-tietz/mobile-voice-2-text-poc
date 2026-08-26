@@ -2,6 +2,7 @@ package ai.healthcarepoc.voice
 
 import kotlinx.cinterop.ExperimentalForeignApi
 import kotlinx.cinterop.addressOf
+import kotlinx.cinterop.get
 import kotlinx.cinterop.memScoped
 import kotlinx.cinterop.pointed
 import kotlinx.cinterop.readValue
@@ -9,16 +10,12 @@ import kotlinx.cinterop.usePinned
 import platform.Foundation.NSProcessInfo
 import whispercinterop.whisper_vad_context_params
 import whispercinterop.whisper_vad_default_context_params
-import whispercinterop.whisper_vad_default_params
 import whispercinterop.whisper_vad_detect_speech_no_reset
 import whispercinterop.whisper_vad_free
-import whispercinterop.whisper_vad_free_segments
 import whispercinterop.whisper_vad_init_from_file_with_params
+import whispercinterop.whisper_vad_n_probs
+import whispercinterop.whisper_vad_probs
 import whispercinterop.whisper_vad_reset_state
-import whispercinterop.whisper_vad_segments_from_probs
-import whispercinterop.whisper_vad_segments_get_segment_t0
-import whispercinterop.whisper_vad_segments_get_segment_t1
-import whispercinterop.whisper_vad_segments_n_segments
 import kotlin.math.max
 
 @OptIn(ExperimentalForeignApi::class)
@@ -31,24 +28,23 @@ actual class WhisperVad actual constructor(modelPath: String) : VoiceActivityDet
             ?: error("Failed to load VAD model at $modelPath")
     }
 
-    actual override fun feed(samples: FloatArray) {
-        samples.usePinned { pinned ->
+    // Classifies exactly the given chunk as speech/non-speech. whisper_vad_detect_speech_no_reset
+    // overwrites the VAD context's probability buffer with only this call's chunk each time - it
+    // does NOT accumulate across calls. Only the model's recurrent hidden state carries forward.
+    // So the probabilities must be read back immediately, before the next call overwrites them.
+    actual override fun speechProbability(samples: FloatArray): Float {
+        val detected = samples.usePinned { pinned ->
             whisper_vad_detect_speech_no_reset(vctx, pinned.addressOf(0), samples.size)
         }
-    }
+        if (!detected) return 0.0f
 
-    actual override fun segments(minSilenceDurationMs: Int): List<ClosedFloatingPointRange<Float>> = memScoped {
-        val params = whisper_vad_default_params().getPointer(this).pointed
-        params.min_silence_duration_ms = minSilenceDurationMs
-
-        val segments = whisper_vad_segments_from_probs(vctx, params.readValue())
-            ?: error("whisper_vad_segments_from_probs returned null")
-        val n = whisper_vad_segments_n_segments(segments)
-        val result = (0 until n).map { i ->
-            whisper_vad_segments_get_segment_t0(segments, i)..whisper_vad_segments_get_segment_t1(segments, i)
+        val nProbs = whisper_vad_n_probs(vctx)
+        val probs = whisper_vad_probs(vctx) ?: return 0.0f
+        var maxProb = 0.0f
+        for (i in 0 until nProbs) {
+            maxProb = max(maxProb, probs[i])
         }
-        whisper_vad_free_segments(segments)
-        result
+        return maxProb
     }
 
     actual override fun resetState() {
