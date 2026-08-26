@@ -49,6 +49,10 @@ Java_ai_healthcarepoc_voice_WhisperEngine_nativeTranscribe(JNIEnv *env, jobject 
     // mit normalen Pausen."), one of which also ballooned to 45s of decode time since
     // max_tokens was unbounded. max_tokens below is a hard backstop on top of that.
     struct whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_BEAM_SEARCH);
+    // Widened from whisper.cpp's own default of 5: more candidate hypotheses per segment
+    // helps recover the correct word when the acoustic signal is ambiguous (unclear/quiet
+    // speech), at the cost of decode time scaling roughly with beam size.
+    wparams.beam_search.beam_size = 8;
     wparams.language = "de";
     wparams.translate = false;
     wparams.print_progress = false;

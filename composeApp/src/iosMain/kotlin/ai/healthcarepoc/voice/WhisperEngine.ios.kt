@@ -56,6 +56,10 @@ actual class WhisperEngine actual constructor(modelPath: String) : Transcriber {
         // max_tokens was unbounded. max_tokens below is a hard backstop on top of that.
         val params = whisper_full_default_params(whisper_sampling_strategy.WHISPER_SAMPLING_BEAM_SEARCH)
             .getPointer(this).pointed
+        // Widened from whisper.cpp's own default of 5: more candidate hypotheses per segment
+        // helps recover the correct word when the acoustic signal is ambiguous (unclear/quiet
+        // speech), at the cost of decode time scaling roughly with beam size.
+        params.beam_search.beam_size = 8
         params.language = "de".cstr.ptr
         params.translate = false
         params.print_progress = false
