@@ -28,11 +28,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.newSingleThreadContext
 
 enum class AsrEngine { WHISPER, NATIVE }
 
@@ -80,6 +82,12 @@ fun App(
     var uiState by remember { mutableStateOf<UiState>(UiState.Idle) }
     var transcript by remember { mutableStateOf(listOf<String>()) }
     val scope = remember { CoroutineScope(Dispatchers.Default) }
+    // Dispatchers.IO isn't accessible from commonMain (JVM/Native-only, internal here) - a
+    // dedicated single thread, entirely separate from Default's shared CPU-bound pool, gives
+    // the long-running blocking transcribe() call somewhere to run without starving Default's
+    // limited threads out from under segmenterJob. See consumerJob below for why this matters.
+    @OptIn(DelicateCoroutinesApi::class)
+    val transcribeDispatcher = remember { newSingleThreadContext("WhisperTranscribe") }
     var selectedEngine by remember { mutableStateOf(AsrEngine.WHISPER) }
     var whisperSegmentsShown by remember { mutableStateOf(0) }
     val nativeAvailable = remember(nativeAsr) { nativeAsr?.isAvailable() ?: false }
@@ -105,8 +113,13 @@ fun App(
             // suspend functions, so cancelling scope cannot interrupt one already in progress.
             // This leaks the handles in that rare case instead of crashing; ordinary disposal
             // while idle (the common case) still releases correctly.
+            // transcribeDispatcher.close() is gated the same way: closing it while consumerJob
+            // is still running on it (e.g. mid in-flight transcribe() call) risks the coroutine
+            // hitting a rejected-execution error trying to continue on a closed dispatcher once
+            // that call returns - same leak-over-crash tradeoff as the handle release above.
             if (uiState != UiState.Recording && uiState != UiState.Stopping) {
                 pipeline?.release()
+                transcribeDispatcher.close()
             }
         }
     }
@@ -159,7 +172,18 @@ fun App(
 
                 // Stage 2: transcribe consumer. Unchanged in spirit from before - just now
                 // fed from segmentChannel (already-finalized segments) instead of raw audio.
-                consumerJob = scope.launch {
+                // Dispatched on transcribeDispatcher (its own dedicated thread), not the shared
+                // scope's Default: transcribe() is a long-running blocking native call (not a
+                // suspend function, so it never yields), and running it on Default's small
+                // CPU-bound pool would starve segmenterJob out of that same pool while a
+                // transcribe() call is in flight - reintroducing exactly the decode-timing
+                // coupling this two-stage pipeline exists to avoid, just via thread contention
+                // instead of a shared queue. Confirmed on-device: segments recorded while no
+                // transcribe() was in flight came out as one clean multi-second chunk; segments
+                // recorded while one was running got chopped to under a second, with visibly bursty
+                // (non-100ms-steady) chunk timestamps - and Whisper hallucinated "[MUSIK]"/"[P]" on
+                // the resulting short fragments.
+                consumerJob = scope.launch(transcribeDispatcher) {
                     for (segment in segments) {
                         activePipeline.session.transcribeSegment(segment)
                         val allSegments = activePipeline.session.segments

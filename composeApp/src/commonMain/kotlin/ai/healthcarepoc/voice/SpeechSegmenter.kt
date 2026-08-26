@@ -11,7 +11,13 @@ class SpeechSegmenter(
     private val sampleRateHz: Int,
     private val minSilenceDurationMs: Int = 500,
     private val threshold: Float = 0.5f,
-    private val negThreshold: Float = 0.35f
+    // Confirmed on-device (2026-08-26): whisper.cpp's own 0.35 default, tuned for its
+    // whole-file batch analysis, is too easily satisfied by per-100ms-chunk classification -
+    // natural volume dips *within* continuous real speech (unstressed syllables, consonants)
+    // routinely read below 0.35, so the segmenter mistook "still talking, just quieter" for
+    // "stopped talking" and cut mid-sentence. Lowered so only chunks the model is genuinely
+    // confident are silent count toward the pause timer.
+    private val negThreshold: Float = 0.15f
 ) {
     private val pendingSamples = mutableListOf<Float>()
 
