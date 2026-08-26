@@ -102,46 +102,90 @@ architecture diagram, the two-stage pipeline, and everything else in this
 spec is unaffected — the fix in this section is *smaller* than the original
 design, not larger, since it never depended on the broken assumption.
 
-## Components (corrected)
+## Components (corrected, revised after a second independent review)
+
+A second independent review of this correction verified all four
+whisper.cpp source claims above (confirmed at the cited line numbers, in
+two cases understated rather than overstated — e.g. `whisper_vad_probs()`
+returns **centiseconds**, not seconds, meaning the original design's
+`accept()` slicing math, which multiplied by `sampleRateHz` as if they were
+seconds, had a latent 100x unit bug on top of everything else; moot now
+since `segments_from_probs()` is dropped entirely) and surfaced one real
+refinement plus two secondary confirmations, folded in below.
 
 **`VoiceActivityDetector`** (replaces the original interface below):
 
 ```kotlin
 interface VoiceActivityDetector {
-    // Classifies one capture chunk as speech or not, informed by every
+    // Speech probability [0, 1] for one capture chunk, informed by every
     // chunk fed before it (the model's recurrent state carries forward
-    // across calls even though its probability output does not).
-    fun isSpeech(samples: FloatArray): Boolean
+    // across calls even though its probability output does not - see
+    // Correction above). Returns the max across the chunk's sub-windows,
+    // not an average, so a short loud syllable in an otherwise-quiet chunk
+    // isn't diluted away.
+    fun speechProbability(samples: FloatArray): Float
     fun resetState()
 }
 ```
 
+Deliberately returns a raw `Float`, not a `Boolean` — thresholding needs
+hysteresis (below), which is inherently stateful across chunks, so it
+belongs in `SpeechSegmenter`, not here.
+
 **`WhisperVad`** (replaces the original description below): wraps
 `whisper_vad_context`, loaded from the bundled VAD model at startup
-alongside the ASR model. `isSpeech()` calls
-`whisper_vad_detect_speech_no_reset()` on exactly the given chunk, then
-reads `whisper_vad_probs()`/`whisper_vad_n_probs()` immediately (before the
-next call overwrites them) and returns `true` if any of that chunk's
-sub-window probabilities meet whisper.cpp's default `threshold` (0.5, from
-`whisper_vad_default_params()`) — a chunk this size (100ms) may span
-multiple of the model's native windows, so "any window over threshold"
-rather than an average avoids diluting a short loud syllable inside an
-otherwise-quiet chunk. `whisper_vad_segments_from_probs()` is not called at
-all in the corrected design.
+alongside the ASR model. `speechProbability()` calls
+`whisper_vad_detect_speech_no_reset()` on exactly the given chunk (logging
+if it returns `false` — a compute failure — since a silent failure would
+otherwise surface only as stale/zeroed probabilities with no diagnostic
+trail), then reads `whisper_vad_probs()`/`whisper_vad_n_probs()`
+immediately, before the next call overwrites them, and returns the max.
+`whisper_vad_segments_from_probs()` is not called at all in the corrected
+design.
+
+*Known, accepted limitation:* `whisper_vad_detect_speech_no_reset()`
+internally splits each call into the model's native window size
+(confirmed via the actual bundled model: `n_window=512` samples for
+`ggml-silero-v6.2.0.bin`) and zero-pads a trailing partial window rather
+than carrying the remainder to the next call. Capture chunks (1600 samples)
+aren't a multiple of 512, so roughly one padded, silence-biased window gets
+fed into the model's hidden state per `feed()` call. `n_window` has no
+public accessor (`whisper_vad_context` is opaque in `whisper.h`), so
+aligning to it exactly would mean depending on a private struct field that
+could change across model/library versions — not worth it for what both
+reviews characterized as a small, bounded precision effect (one padded
+~32ms window out of several real ones per 100ms call), not a correctness
+break. Revisit only if on-device testing shows it actually degrades
+boundary accuracy.
 
 **`SpeechSegmenter`** (replaces the original description below): now owns
-the trailing-silence-duration state machine itself (feed a chunk to
-`vad.isSpeech()`, accumulate `trailingSilenceMs`, cut when it crosses
-`minSilenceDurationMs`) — structurally the same shape as the old
-`PauseDetector`, including a `hadSpeech`-equivalent guard so `flush()`
-doesn't hand a purely-silent trailing buffer to `transcribe()` (this also
-supersedes the **Removed** section's claim that the hallucination guard is
-"structurally unnecessary" — with the corrected design it's necessary
-again, just re-implemented against VAD probability instead of RMS). Public
-signature (`accept(samples): List<FloatArray>`, `flush(): FloatArray?`)
-stays the same as the original design below, so nothing in `App.kt`'s
-wiring needs to change — only `SpeechSegmenter`'s internals and the
-`VoiceActivityDetector` contract underneath it do.
+the trailing-silence-duration state machine itself — mirrors whisper.cpp's
+own hysteresis (`whisper.cpp:5252-5255`, applied at `5285`/`5316`) rather
+than a single threshold, to avoid boundary chatter right at the edge:
+
+```kotlin
+class SpeechSegmenter(
+    private val vad: VoiceActivityDetector,
+    private val sampleRateHz: Int,
+    private val minSilenceDurationMs: Int = 500,
+    private val threshold: Float = 0.5f,      // enter speech: prob >= threshold
+    private val negThreshold: Float = 0.35f   // stay in speech until prob < negThreshold
+) { /* same public accept()/flush() signature as the original design below */ }
+```
+
+Feed a chunk to `vad.speechProbability()`; while not currently in a speech
+run, entering one requires crossing `threshold`; once in one, only
+`trailingSilenceMs` built from chunks below `negThreshold` counts toward
+`minSilenceDurationMs`. Includes a `hadSpeech`-equivalent guard so
+`flush()` doesn't hand a purely-silent trailing buffer to `transcribe()`
+(this also supersedes the **Removed** section's claim that the
+hallucination guard is "structurally unnecessary" — with the corrected
+design it's necessary again, just re-implemented against VAD probability
+instead of RMS). Public signature (`accept(samples): List<FloatArray>`,
+`flush(): FloatArray?`) stays the same as the original design below, so
+nothing in `App.kt`'s channel/coroutine wiring needs to change — only
+`SpeechSegmenter`'s internals and the `VoiceActivityDetector` contract
+underneath it do.
 
 **Also found during final review, unrelated to the calling-pattern bug, both addressed alongside this correction:**
 - The VAD model file is copied to `iosApp/iosApp/Resources/` by the
@@ -154,7 +198,11 @@ wiring needs to change — only `SpeechSegmenter`'s internals and the
   production code, only from instrumented tests — pre-existing for
   `WhisperEngine` (predates this plan), now doubled up with `WhisperVad`.
   `App.kt`'s `pipeline` `remember{}` needs a `DisposableEffect`/`onDispose`
-  releasing both.
+  releasing both — which means `WhisperPipeline` (the small holder class
+  introduced in `App.kt`) needs to retain the `WhisperEngine`/`WhisperVad`
+  references directly, not just the `TranscriptionSession`/`SpeechSegmenter`
+  wrapping them, since neither wrapper exposes the underlying native handle
+  today.
 
 ## Goals
 
