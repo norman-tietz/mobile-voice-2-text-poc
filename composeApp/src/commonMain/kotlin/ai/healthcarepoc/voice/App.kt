@@ -25,6 +25,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CoroutineScope
@@ -71,6 +75,20 @@ private class WhisperPipeline(
     }
 }
 
+// Carries the time a segment was handed off to segmentChannel, so the consumer side can log
+// how long it sat in the queue before transcribe() picked it up - the direct signal for whether
+// the pipeline is falling behind live speech (see consumerJob below).
+private class TimedSegment(val samples: FloatArray, val enqueuedAtMs: Long)
+
+// One line of the on-screen transcript history: either a recognized segment (engine marker +
+// text) or a per-recording metrics summary. Kept as a sealed type instead of a plain String so
+// the two can be styled differently - the marker/summary are visual noise next to the actual
+// recognized text and are greyed out accordingly, see the rendering in App() below.
+private sealed interface TranscriptEntry {
+    data class Segment(val engineLabel: String, val text: String) : TranscriptEntry
+    data class Metrics(val summary: String) : TranscriptEntry
+}
+
 @Composable
 fun App(
     audioCapture: AudioCapture,
@@ -80,7 +98,7 @@ fun App(
     nativeAsr: NativeAsrEngine? = null
 ) {
     var uiState by remember { mutableStateOf<UiState>(UiState.Idle) }
-    var transcript by remember { mutableStateOf(listOf<String>()) }
+    var transcript by remember { mutableStateOf(listOf<TranscriptEntry>()) }
     val scope = remember { CoroutineScope(Dispatchers.Default) }
     // Dispatchers.IO isn't accessible from commonMain (JVM/Native-only, internal here) - a
     // dedicated single thread, entirely separate from Default's shared CPU-bound pool, gives
@@ -97,6 +115,7 @@ fun App(
     // and an error state is shown instead of letting the app crash on first use.
     val pipeline = remember {
         runCatching {
+            val loadStartMs = nowMs()
             val engine = WhisperEngine(modelPathProvider.resolveModelPath())
             // If WhisperVad's init throws, engine is already holding a native context - release
             // it here rather than letting it leak, since pipeline (and the DisposableEffect that
@@ -107,7 +126,13 @@ fun App(
                 engine.release()
                 throw e
             }
-            WhisperPipeline(TranscriptionSession(engine), SpeechSegmenter(vad, sampleRateHz = 16_000), engine, vad)
+            debugLog("App: Whisper model + VAD load time=${nowMs() - loadStartMs}ms")
+            WhisperPipeline(
+                TranscriptionSession(engine, sampleRateHz = 16_000),
+                SpeechSegmenter(vad, sampleRateHz = 16_000),
+                engine,
+                vad
+            )
         }.onFailure { e ->
             uiState = UiState.Error(e.message ?: "Failed to load speech model")
         }.getOrNull()
@@ -142,12 +167,21 @@ fun App(
     // enqueues samples (fast, non-blocking); a separate consumer coroutine drains the queue
     // and performs acceptAudio()/transcribe() sequentially, off the capture thread.
     var audioChannel by remember { mutableStateOf<Channel<FloatArray>?>(null) }
-    var segmentChannel by remember { mutableStateOf<Channel<FloatArray>?>(null) }
+    var segmentChannel by remember { mutableStateOf<Channel<TimedSegment>?>(null) }
     var segmenterJob by remember { mutableStateOf<Job?>(null) }
     var consumerJob by remember { mutableStateOf<Job?>(null) }
     var nativeStartJob by remember { mutableStateOf<Job?>(null) }
+    // Timestamp of the Record tap, for the end-to-end and time-to-first-segment metrics below.
+    var recordStartMs by remember { mutableStateOf(0L) }
+    var timeToFirstSegmentMs by remember { mutableStateOf<Long?>(null) }
+    var segmentMetrics by remember { mutableStateOf<List<SegmentMetrics>>(emptyList()) }
+    var segmentBacklogsMs by remember { mutableStateOf<List<Long>>(emptyList()) }
 
     fun startRecording() {
+        recordStartMs = nowMs()
+        timeToFirstSegmentMs = null
+        segmentMetrics = emptyList()
+        segmentBacklogsMs = emptyList()
         debugLog("App.startRecording: entered, engine=$selectedEngine")
         when (selectedEngine) {
             AsrEngine.WHISPER -> {
@@ -156,7 +190,7 @@ fun App(
 
                 val audio = Channel<FloatArray>(Channel.UNLIMITED)
                 audioChannel = audio
-                val segments = Channel<FloatArray>(Channel.UNLIMITED)
+                val segments = Channel<TimedSegment>(Channel.UNLIMITED)
                 segmentChannel = segments
 
                 // Stage 1: real-time segmenter. Only does VAD-driven boundary detection -
@@ -166,14 +200,14 @@ fun App(
                 segmenterJob = scope.launch {
                     for (samples in audio) {
                         activePipeline.segmenter.accept(samples).forEach { segment ->
-                            val result = segments.trySend(segment)
+                            val result = segments.trySend(TimedSegment(segment, nowMs()))
                             if (result.isFailure) {
                                 debugLog("App: segmentChannel.trySend failed (channel closed?): $result")
                             }
                         }
                     }
                     activePipeline.segmenter.flush()?.let { segment ->
-                        segments.trySend(segment)
+                        segments.trySend(TimedSegment(segment, nowMs()))
                     }
                     segments.close()
                     debugLog("App: segmenter loop exiting (audioChannel closed)")
@@ -192,13 +226,23 @@ fun App(
                 // recorded while one was running got chopped to under a second, with visibly bursty
                 // (non-100ms-steady) chunk timestamps - and Whisper hallucinated "[MUSIK]"/"[P]" on
                 // the resulting short fragments.
+                var firstSegmentLogged = false
                 consumerJob = scope.launch(transcribeDispatcher) {
-                    for (segment in segments) {
-                        activePipeline.session.transcribeSegment(segment)
+                    for (timedSegment in segments) {
+                        val backlogMs = nowMs() - timedSegment.enqueuedAtMs
+                        debugLog("App: dequeued segment after ${backlogMs}ms in segmentChannel")
+                        segmentBacklogsMs = segmentBacklogsMs + backlogMs
+                        val metrics = activePipeline.session.transcribeSegment(timedSegment.samples)
+                        segmentMetrics = segmentMetrics + metrics
                         val allSegments = activePipeline.session.segments
                         if (allSegments.size > whisperSegmentsShown) {
+                            if (!firstSegmentLogged) {
+                                timeToFirstSegmentMs = nowMs() - recordStartMs
+                                debugLog("App: time-to-first-segment=${timeToFirstSegmentMs}ms")
+                                firstSegmentLogged = true
+                            }
                             transcript = transcript + allSegments.subList(whisperSegmentsShown, allSegments.size)
-                                .map { "[Whisper] $it" }
+                                .map { TranscriptEntry.Segment("Whisper", it) }
                             whisperSegmentsShown = allSegments.size
                         }
                     }
@@ -220,7 +264,7 @@ fun App(
                 nativeStartJob = scope.launch {
                     runCatching {
                         engine.start(
-                            onSegment = { text -> transcript = transcript + "[Native] $text" },
+                            onSegment = { text -> transcript = transcript + TranscriptEntry.Segment("Native", text) },
                             onError = { message -> uiState = UiState.Error(message) }
                         )
                     }.onFailure { e ->
@@ -266,7 +310,7 @@ fun App(
                 val finalSegments = activePipeline.session.segments
                 if (finalSegments.size > whisperSegmentsShown) {
                     transcript = transcript + finalSegments.subList(whisperSegmentsShown, finalSegments.size)
-                        .map { "[Whisper] $it" }
+                        .map { TranscriptEntry.Segment("Whisper", it) }
                     whisperSegmentsShown = finalSegments.size
                 }
                 debugLog("App.stopRecording: session.stop() returned after ${nowMs() - t2}ms, segments=${finalSegments.size}")
@@ -280,6 +324,22 @@ fun App(
                 debugLog("App.stopRecording: nativeAsr.stop() returned after ${nowMs() - t0}ms")
             }
         }
+        val endToEndMs = nowMs() - recordStartMs
+        debugLog("App.stopRecording: end-to-end time=${endToEndMs}ms")
+        val summary = when (selectedEngine) {
+            AsrEngine.WHISPER -> {
+                val firstSegmentText = timeToFirstSegmentMs?.let { "${it}ms" } ?: "n/a"
+                val avgRtf = if (segmentMetrics.isNotEmpty()) roundTo2(segmentMetrics.map { it.rtf }.average()) else 0.0
+                val maxRtf = segmentMetrics.maxOfOrNull { it.rtf } ?: 0.0
+                val maxBacklogMs = segmentBacklogsMs.maxOrNull() ?: 0L
+                "End-to-end: ${endToEndMs}ms | First segment: $firstSegmentText | " +
+                    "Segments: ${segmentMetrics.size} (avg RTF $avgRtf, max $maxRtf) | Max backlog: ${maxBacklogMs}ms"
+            }
+            AsrEngine.NATIVE -> "End-to-end: ${endToEndMs}ms"
+        }
+        // Appended to the transcript history (not a separate transient field) so it survives
+        // into the next recording instead of disappearing the moment Record is tapped again.
+        transcript = transcript + TranscriptEntry.Metrics(summary)
         uiState = UiState.Idle
         debugLog("App.stopRecording: uiState=Idle")
     }
@@ -366,7 +426,23 @@ fun App(
                     }
                     else -> {
                         Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-                            transcript.forEach { segment -> Text(segment) }
+                            transcript.forEach { entry ->
+                                when (entry) {
+                                    is TranscriptEntry.Segment -> Text(
+                                        buildAnnotatedString {
+                                            withStyle(SpanStyle(color = Color.Gray)) {
+                                                append("[${entry.engineLabel}] ")
+                                            }
+                                            append(entry.text)
+                                        }
+                                    )
+                                    is TranscriptEntry.Metrics -> Text(
+                                        entry.summary,
+                                        color = Color.Gray,
+                                        fontSize = 12.sp
+                                    )
+                                }
+                            }
                         }
                     }
                 }

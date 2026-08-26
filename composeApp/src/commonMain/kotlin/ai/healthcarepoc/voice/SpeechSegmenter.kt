@@ -60,14 +60,25 @@ class SpeechSegmenter(
                 "trailingSilenceMs=$trailingSilenceMs, pendingSamples=$pendingSampleCount"
         )
 
-        if (inSpeech && (trailingSilenceMs >= minSilenceDurationMs || bufferedDurationMs >= maxSegmentDurationMs)) {
-            debugLog("SpeechSegmenter.accept: trailing silence threshold or max duration reached, finalizing segment")
+        // Tracked separately so metrics can tell a normal pause-triggered cut apart from the
+        // duration cap kicking in (the latter should be rare - frequent cap hits on-device
+        // would mean the ambiguous-band problem is still showing up in practice).
+        val silenceTriggered = trailingSilenceMs >= minSilenceDurationMs
+        val capTriggered = bufferedDurationMs >= maxSegmentDurationMs
+        if (inSpeech && (silenceTriggered || capTriggered)) {
+            debugLog(
+                "SpeechSegmenter.accept: finalizing segment (silenceTriggered=$silenceTriggered, " +
+                    "capTriggered=$capTriggered, bufferedDurationMs=$bufferedDurationMs)"
+            )
             return finalize()
         }
-        if (!inSpeech && (trailingSilenceMs >= minSilenceDurationMs || bufferedDurationMs >= maxSegmentDurationMs)) {
+        if (!inSpeech && (silenceTriggered || capTriggered)) {
             // Long silence, or long ambiguous-but-never-speech noise, before any speech started -
             // drop it so pendingSamples doesn't grow unboundedly while nothing is being said.
-            debugLog("SpeechSegmenter.accept: dropping silence-only buffer (no speech yet)")
+            debugLog(
+                "SpeechSegmenter.accept: dropping silence-only buffer (silenceTriggered=$silenceTriggered, " +
+                    "capTriggered=$capTriggered, bufferedDurationMs=$bufferedDurationMs)"
+            )
             clearPending()
             trailingSilenceMs = 0
         }
@@ -117,7 +128,8 @@ class SpeechSegmenter(
             offset += chunk.size
         }
         clearPending()
-        debugLog("SpeechSegmenter.finalize: emitting segment of ${segment.size} samples")
+        val durationMs = (segment.size * 1000) / sampleRateHz
+        debugLog("SpeechSegmenter.finalize: emitting segment of ${segment.size} samples (${durationMs}ms)")
         return listOf(segment)
     }
 }
