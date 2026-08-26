@@ -55,7 +55,18 @@ private fun EngineToggleButton(label: String, selected: Boolean, enabled: Boolea
 // Bundles the two Whisper-path components that must be constructed together (and fail
 // together) at session start: the segmenter (VAD-driven, real-time) and the
 // transcription session (slow, decoupled via segmentChannel - see startRecording()).
-private class WhisperPipeline(val session: TranscriptionSession, val segmenter: SpeechSegmenter)
+// Retains native handles (engine, vad) so they can be released when the pipeline is disposed.
+private class WhisperPipeline(
+    val session: TranscriptionSession,
+    val segmenter: SpeechSegmenter,
+    private val engine: WhisperEngine,
+    private val vad: WhisperVad
+) {
+    fun release() {
+        engine.release()
+        vad.release()
+    }
+}
 
 @Composable
 fun App(
@@ -78,10 +89,13 @@ fun App(
         runCatching {
             val engine = WhisperEngine(modelPathProvider.resolveModelPath())
             val vad = WhisperVad(modelPathProvider.resolveVadModelPath())
-            WhisperPipeline(TranscriptionSession(engine), SpeechSegmenter(vad, sampleRateHz = 16_000))
+            WhisperPipeline(TranscriptionSession(engine), SpeechSegmenter(vad, sampleRateHz = 16_000), engine, vad)
         }.onFailure { e ->
             uiState = UiState.Error(e.message ?: "Failed to load speech model")
         }.getOrNull()
+    }
+    DisposableEffect(pipeline) {
+        onDispose { pipeline?.release() }
     }
 
     // Decouples audio capture from transcription. The capture thread (AudioCapture's reader
