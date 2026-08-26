@@ -4,18 +4,11 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
 
-private class FakeVad(
-    private val segmentsPerCall: MutableList<List<ClosedFloatingPointRange<Float>>>
-) : VoiceActivityDetector {
-    val fedChunks = mutableListOf<FloatArray>()
+private class FakeVad(private val probsPerCall: MutableList<Float>) : VoiceActivityDetector {
     var resetCalls = 0
 
-    override fun feed(samples: FloatArray) {
-        fedChunks.add(samples)
-    }
-
-    override fun segments(minSilenceDurationMs: Int): List<ClosedFloatingPointRange<Float>> =
-        if (segmentsPerCall.isNotEmpty()) segmentsPerCall.removeAt(0) else emptyList()
+    override fun speechProbability(samples: FloatArray): Float =
+        if (probsPerCall.isNotEmpty()) probsPerCall.removeAt(0) else 0.0f
 
     override fun resetState() {
         resetCalls++
@@ -30,86 +23,81 @@ class SpeechSegmenterTest {
     private fun chunk(value: Float): FloatArray = FloatArray(1600) { value }
 
     @Test
-    fun `accept returns nothing while the VAD has not closed any segment`() {
-        val vad = FakeVad(mutableListOf(emptyList(), emptyList()))
-        val segmenter = SpeechSegmenter(vad, sampleRate)
+    fun `accept returns nothing while probability stays below threshold`() {
+        val vad = FakeVad(mutableListOf(0.1f, 0.1f))
+        val segmenter = SpeechSegmenter(vad, sampleRate, minSilenceDurationMs = 700)
 
-        val result1 = segmenter.accept(chunk(0.5f))
-        val result2 = segmenter.accept(chunk(0.5f))
-
-        assertEquals(emptyList(), result1)
-        assertEquals(emptyList(), result2)
+        assertEquals(emptyList(), segmenter.accept(chunk(0.5f)))
+        assertEquals(emptyList(), segmenter.accept(chunk(0.5f)))
     }
 
     @Test
-    fun `accept returns a newly closed segment sliced from the buffered samples`() {
-        // Two 100ms chunks fed (200ms total = 3200 samples). On the second accept()
-        // call, the VAD reports one closed segment spanning the first 100ms (0.0-0.1s
-        // = samples 0 until 1600) - i.e. only the first chunk's content.
-        val vad = FakeVad(mutableListOf(emptyList(), listOf(0.0f..0.1f)))
-        val segmenter = SpeechSegmenter(vad, sampleRate)
-        val firstChunk = chunk(1.0f)
-        val secondChunk = chunk(2.0f)
+    fun `finalizes a segment after speech then enough trailing low-probability chunks`() {
+        val vad = FakeVad((mutableListOf(0.9f) + List(7) { 0.1f }).toMutableList())
+        val segmenter = SpeechSegmenter(vad, sampleRate, minSilenceDurationMs = 700)
 
-        segmenter.accept(firstChunk)
-        val result = segmenter.accept(secondChunk)
+        segmenter.accept(chunk(1.0f))
+        var result: List<FloatArray> = emptyList()
+        repeat(7) { result = segmenter.accept(chunk(0.0f)) }
 
         assertEquals(1, result.size)
-        assertEquals(firstChunk.toList(), result[0].toList())
     }
 
     @Test
-    fun `accept does not re-emit a segment already returned in an earlier call`() {
-        // First call closes segment [0.0, 0.1]; second call's VAD result still includes
-        // that same segment (as whisper_vad_segments_from_probs recomputes from the
-        // whole trace each time) plus one new one [0.1, 0.2] - only the new one should
-        // come back out.
-        val vad = FakeVad(mutableListOf(listOf(0.0f..0.1f), listOf(0.0f..0.1f, 0.1f..0.2f)))
-        val segmenter = SpeechSegmenter(vad, sampleRate)
-        val firstChunk = chunk(1.0f)
-        val secondChunk = chunk(2.0f)
+    fun `drops a silent buffer that never had speech, without emitting it`() {
+        val vad = FakeVad(MutableList(7) { 0.1f })
+        val segmenter = SpeechSegmenter(vad, sampleRate, minSilenceDurationMs = 700)
 
-        val firstResult = segmenter.accept(firstChunk)
-        val secondResult = segmenter.accept(secondChunk)
+        var sawSegment = false
+        repeat(7) { if (segmenter.accept(chunk(0.0f)).isNotEmpty()) sawSegment = true }
 
-        assertEquals(1, firstResult.size)
-        assertEquals(1, secondResult.size)
-        assertEquals(secondChunk.toList(), secondResult[0].toList())
+        assertEquals(false, sawSegment)
+        assertNull(segmenter.flush())
     }
 
     @Test
-    fun `flush returns the still-open tail after the last emitted segment`() {
-        // Real whisper_vad_segments_from_probs() recomputes cumulatively from the whole
-        // trace each call, so a segment already closed keeps reappearing in later calls
-        // even when nothing new has closed - the fake mirrors that (same list twice)
-        // rather than shrinking back to empty, which a real VAD would never do.
-        val vad = FakeVad(mutableListOf(listOf(0.0f..0.1f), listOf(0.0f..0.1f)))
-        val segmenter = SpeechSegmenter(vad, sampleRate)
-        val firstChunk = chunk(1.0f)
-        val secondChunk = chunk(2.0f)
+    fun `stays in speech through an ambiguous chunk between negThreshold and threshold`() {
+        // 0.9 enters speech; 0.4 is between negThreshold(0.35) and threshold(0.5) - must NOT
+        // count as silence and must NOT exit speech; trailing silence still needs the full
+        // duration counted only from genuinely low-probability chunks afterward.
+        val vad = FakeVad((mutableListOf(0.9f, 0.4f) + List(7) { 0.1f }).toMutableList())
+        val segmenter = SpeechSegmenter(vad, sampleRate, minSilenceDurationMs = 700)
 
-        segmenter.accept(firstChunk) // closes [0.0, 0.1] = firstChunk
-        segmenter.accept(secondChunk) // no new closed segment; secondChunk stays pending
+        segmenter.accept(chunk(1.0f)) // 0.9 -> enters speech
+        val ambiguous = segmenter.accept(chunk(1.0f)) // 0.4 -> ambiguous, stays in speech
+        assertEquals(emptyList(), ambiguous)
 
+        var result: List<FloatArray> = emptyList()
+        repeat(7) { result = segmenter.accept(chunk(0.0f)) }
+        assertEquals(1, result.size)
+    }
+
+    @Test
+    fun `flush returns the pending buffer if it had speech`() {
+        val vad = FakeVad(mutableListOf(0.9f))
+        val segmenter = SpeechSegmenter(vad, sampleRate, minSilenceDurationMs = 700)
+        val speechChunk = chunk(1.0f)
+
+        segmenter.accept(speechChunk)
         val tail = segmenter.flush()
 
-        assertEquals(secondChunk.toList(), tail!!.toList())
+        assertEquals(speechChunk.toList(), tail!!.toList())
     }
 
     @Test
-    fun `flush returns null when everything has already been emitted`() {
-        val vad = FakeVad(mutableListOf(listOf(0.0f..0.1f)))
-        val segmenter = SpeechSegmenter(vad, sampleRate)
+    fun `flush returns null when nothing pending had speech`() {
+        val vad = FakeVad(mutableListOf(0.1f))
+        val segmenter = SpeechSegmenter(vad, sampleRate, minSilenceDurationMs = 700)
 
-        segmenter.accept(chunk(1.0f)) // closes exactly the one chunk fed so far
+        segmenter.accept(chunk(0.0f))
 
         assertNull(segmenter.flush())
     }
 
     @Test
-    fun `reset clears buffered state and resets the VAD`() {
-        val vad = FakeVad(mutableListOf(emptyList(), emptyList()))
-        val segmenter = SpeechSegmenter(vad, sampleRate)
+    fun `reset clears state and calls vad resetState`() {
+        val vad = FakeVad(mutableListOf(0.9f))
+        val segmenter = SpeechSegmenter(vad, sampleRate, minSilenceDurationMs = 700)
         segmenter.accept(chunk(1.0f))
 
         segmenter.reset()
