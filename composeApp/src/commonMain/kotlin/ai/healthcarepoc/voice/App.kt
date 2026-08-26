@@ -52,6 +52,11 @@ private fun EngineToggleButton(label: String, selected: Boolean, enabled: Boolea
     }
 }
 
+// Bundles the two Whisper-path components that must be constructed together (and fail
+// together) at session start: the segmenter (VAD-driven, real-time) and the
+// transcription session (slow, decoupled via segmentChannel - see startRecording()).
+private class WhisperPipeline(val session: TranscriptionSession, val segmenter: SpeechSegmenter)
+
 @Composable
 fun App(
     audioCapture: AudioCapture,
@@ -67,12 +72,13 @@ fun App(
     var whisperSegmentsShown by remember { mutableStateOf(0) }
     val nativeAvailable = remember(nativeAsr) { nativeAsr?.isAvailable() ?: false }
 
-    // Loading the model can fail (missing/corrupt bundled file); session stays null
+    // Loading either model can fail (missing/corrupt bundled file); pipeline stays null
     // and an error state is shown instead of letting the app crash on first use.
-    val session = remember {
+    val pipeline = remember {
         runCatching {
             val engine = WhisperEngine(modelPathProvider.resolveModelPath())
-            TranscriptionSession(engine, PauseDetector(sampleRateHz = 16_000))
+            val vad = WhisperVad(modelPathProvider.resolveVadModelPath())
+            WhisperPipeline(TranscriptionSession(engine), SpeechSegmenter(vad, sampleRateHz = 16_000))
         }.onFailure { e ->
             uiState = UiState.Error(e.message ?: "Failed to load speech model")
         }.getOrNull()
@@ -87,6 +93,8 @@ fun App(
     // enqueues samples (fast, non-blocking); a separate consumer coroutine drains the queue
     // and performs acceptAudio()/transcribe() sequentially, off the capture thread.
     var audioChannel by remember { mutableStateOf<Channel<FloatArray>?>(null) }
+    var segmentChannel by remember { mutableStateOf<Channel<FloatArray>?>(null) }
+    var segmenterJob by remember { mutableStateOf<Job?>(null) }
     var consumerJob by remember { mutableStateOf<Job?>(null) }
     var nativeStartJob by remember { mutableStateOf<Job?>(null) }
 
@@ -94,25 +102,52 @@ fun App(
         debugLog("App.startRecording: entered, engine=$selectedEngine")
         when (selectedEngine) {
             AsrEngine.WHISPER -> {
-                val activeSession = session ?: return
+                val activePipeline = pipeline ?: return
                 uiState = UiState.Recording
-                val channel = Channel<FloatArray>(Channel.UNLIMITED)
-                audioChannel = channel
+
+                val audio = Channel<FloatArray>(Channel.UNLIMITED)
+                audioChannel = audio
+                val segments = Channel<FloatArray>(Channel.UNLIMITED)
+                segmentChannel = segments
+
+                // Stage 1: real-time segmenter. Only does VAD-driven boundary detection -
+                // never calls transcribe() - so it can't fall behind no matter how slow
+                // transcription is. This is what fixes segment boundaries being computed
+                // against a stale backlog (see the design spec's Evidence section).
+                segmenterJob = scope.launch {
+                    for (samples in audio) {
+                        activePipeline.segmenter.accept(samples).forEach { segment ->
+                            val result = segments.trySend(segment)
+                            if (result.isFailure) {
+                                debugLog("App: segmentChannel.trySend failed (channel closed?): $result")
+                            }
+                        }
+                    }
+                    activePipeline.segmenter.flush()?.let { segment ->
+                        segments.trySend(segment)
+                    }
+                    segments.close()
+                    debugLog("App: segmenter loop exiting (audioChannel closed)")
+                }
+
+                // Stage 2: transcribe consumer. Unchanged in spirit from before - just now
+                // fed from segmentChannel (already-finalized segments) instead of raw audio.
                 consumerJob = scope.launch {
-                    for (samples in channel) {
-                        activeSession.acceptAudio(samples)
-                        val allSegments = activeSession.segments
+                    for (segment in segments) {
+                        activePipeline.session.transcribeSegment(segment)
+                        val allSegments = activePipeline.session.segments
                         if (allSegments.size > whisperSegmentsShown) {
                             transcript = transcript + allSegments.subList(whisperSegmentsShown, allSegments.size)
                                 .map { "[Whisper] $it" }
                             whisperSegmentsShown = allSegments.size
                         }
                     }
-                    debugLog("App: audio consumer loop exiting (channel closed)")
+                    debugLog("App: transcribe consumer loop exiting (segmentChannel closed)")
                 }
+
                 audioCapture.start { samples ->
                     val resampled = resampleTo16k(samples, nativeSampleRateHz())
-                    val result = channel.trySend(resampled)
+                    val result = audio.trySend(resampled)
                     if (result.isFailure) {
                         debugLog("App: audioChannel.trySend failed (channel closed?): $result")
                     }
@@ -141,28 +176,40 @@ fun App(
         debugLog("App.stopRecording: entered, engine=$selectedEngine")
         when (selectedEngine) {
             AsrEngine.WHISPER -> {
-                val activeSession = session ?: return
+                val activePipeline = pipeline ?: return
                 val t0 = nowMs()
                 audioCapture.stop()
                 debugLog("App.stopRecording: audioCapture.stop() returned after ${nowMs() - t0}ms")
-                // Close the channel and wait for the consumer to finish processing everything already
-                // queued (including any transcribe() call currently in flight) before force-finalizing
-                // the pending buffer - otherwise stop() could race the consumer and finalize a stale or
-                // incomplete pending buffer.
+                // Drain in pipeline order: audioChannel first (segmenterJob processes whatever was
+                // already captured, flushes its trailing buffer, then closes segmentChannel), then
+                // segmentChannel (consumerJob transcribes whatever the segmenter produced, including
+                // the flushed tail). Each join() only returns once its stage has genuinely finished,
+                // so this can't race a still-in-flight transcribe() call the way finalizing a shared
+                // buffer directly would.
                 val t1 = nowMs()
                 audioChannel?.close()
-                consumerJob?.join()
+                segmenterJob?.join()
+                segmenterJob = null
                 audioChannel = null
+                consumerJob?.join()
                 consumerJob = null
-                debugLog("App.stopRecording: audio consumer drained after ${nowMs() - t1}ms")
+                segmentChannel = null
+                debugLog("App.stopRecording: pipeline drained after ${nowMs() - t1}ms")
                 val t2 = nowMs()
-                val finalSegments = activeSession.stop()
+                activePipeline.session.stop()
+                // pipeline is reused (remember{}'d) across multiple Record/Stop cycles in the
+                // same app session, so the segmenter's buffer/VAD state must be cleared here -
+                // otherwise buffer grows unboundedly across recordings and the next recording's
+                // VAD trace starts contaminated by this one's tail, mirroring why session.stop()
+                // above resets the transcriber's context.
+                activePipeline.segmenter.reset()
+                val finalSegments = activePipeline.session.segments
                 if (finalSegments.size > whisperSegmentsShown) {
                     transcript = transcript + finalSegments.subList(whisperSegmentsShown, finalSegments.size)
                         .map { "[Whisper] $it" }
                     whisperSegmentsShown = finalSegments.size
                 }
-                debugLog("App.stopRecording: activeSession.stop() returned after ${nowMs() - t2}ms, segments=${finalSegments.size}")
+                debugLog("App.stopRecording: session.stop() returned after ${nowMs() - t2}ms, segments=${finalSegments.size}")
             }
             AsrEngine.NATIVE -> {
                 val engine = nativeAsr ?: return
