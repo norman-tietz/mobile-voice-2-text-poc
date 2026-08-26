@@ -5,9 +5,13 @@ import kotlin.test.assertEquals
 
 private class FakeTranscriber(private val responses: MutableList<String>) : Transcriber {
     val callArgs = mutableListOf<FloatArray>()
+    var resetContextCalls = 0
     override fun transcribe(samples: FloatArray): String {
         callArgs.add(samples)
         return responses.removeAt(0)
+    }
+    override fun resetContext() {
+        resetContextCalls++
     }
 }
 
@@ -21,61 +25,42 @@ class TranscriptionSessionTest {
     }
 
     @Test
-    fun `no segments before any pause or stop`() {
+    fun `no segments before any transcribeSegment call`() {
         val transcriber = FakeTranscriber(mutableListOf())
-        val session = TranscriptionSession(transcriber, PauseDetector(sampleRate, minSilenceDurationMs = 700))
-
-        session.acceptAudio(chunk(100, 0.5f))
+        val session = TranscriptionSession(transcriber)
 
         assertEquals(emptyList(), session.segments)
     }
 
     @Test
-    fun `finalizes a segment when a pause is detected`() {
+    fun `transcribeSegment appends the transcribed text to segments`() {
         val transcriber = FakeTranscriber(mutableListOf("hallo welt"))
-        val session = TranscriptionSession(transcriber, PauseDetector(sampleRate, minSilenceDurationMs = 700))
+        val session = TranscriptionSession(transcriber)
 
-        session.acceptAudio(chunk(100, 0.5f))
-        repeat(7) { session.acceptAudio(chunk(100, 0.0f)) }
+        session.transcribeSegment(chunk(100, 0.5f))
 
         assertEquals(listOf("hallo welt"), session.segments)
-    }
-
-    @Test
-    fun `starts a new empty buffer after a segment is finalized`() {
-        val transcriber = FakeTranscriber(mutableListOf("erster satz"))
-        val session = TranscriptionSession(transcriber, PauseDetector(sampleRate, minSilenceDurationMs = 700))
-
-        session.acceptAudio(chunk(100, 0.5f))
-        repeat(7) { session.acceptAudio(chunk(100, 0.0f)) }
-
-        // First call's buffer should be just the loud chunk plus the silence up to the boundary,
-        // not carry over into whatever comes next.
         assertEquals(1, transcriber.callArgs.size)
     }
 
     @Test
-    fun `force-transcribes a pending buffer on stop even without a pause`() {
-        val transcriber = FakeTranscriber(mutableListOf("letzter satz"))
-        val session = TranscriptionSession(transcriber, PauseDetector(sampleRate, minSilenceDurationMs = 700))
+    fun `multiple transcribeSegment calls accumulate in order`() {
+        val transcriber = FakeTranscriber(mutableListOf("erster satz", "zweiter satz"))
+        val session = TranscriptionSession(transcriber)
 
-        session.acceptAudio(chunk(100, 0.5f))
-        val result = session.stop()
+        session.transcribeSegment(chunk(100, 0.5f))
+        session.transcribeSegment(chunk(100, 0.7f))
 
-        assertEquals(listOf("letzter satz"), result)
-        assertEquals(listOf("letzter satz"), session.segments)
+        assertEquals(listOf("erster satz", "zweiter satz"), session.segments)
     }
 
     @Test
-    fun `stop with no pending audio produces no extra segment`() {
-        val transcriber = FakeTranscriber(mutableListOf("hallo welt"))
-        val session = TranscriptionSession(transcriber, PauseDetector(sampleRate, minSilenceDurationMs = 700))
+    fun `stop resets the transcriber context`() {
+        val transcriber = FakeTranscriber(mutableListOf())
+        val session = TranscriptionSession(transcriber)
 
-        session.acceptAudio(chunk(100, 0.5f))
-        repeat(7) { session.acceptAudio(chunk(100, 0.0f)) }
-        val result = session.stop()
+        session.stop()
 
-        assertEquals(listOf("hallo welt"), result)
-        assertEquals(1, transcriber.callArgs.size)
+        assertEquals(1, transcriber.resetContextCalls)
     }
 }

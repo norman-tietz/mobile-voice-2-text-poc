@@ -10,11 +10,13 @@
 		5060452D89EA5A166C45DC1A /* iOSApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 995439431AB2706B7B59BFE8 /* iOSApp.swift */; };
 		705FC7A7CC1547D68414F032 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EA764B65685B597BC2F9099 /* ContentView.swift */; };
 		AEB1D432CE2EB1F3141056AB /* ggml-small.bin in Resources */ = {isa = PBXBuildFile; fileRef = 74A54166EC30340FDD381283 /* ggml-small.bin */; };
+		19DEA6E900AE45F0B5C75939 /* ggml-silero-v6.2.0.bin in Resources */ = {isa = PBXBuildFile; fileRef = D9887132175E4261A02D6681 /* ggml-silero-v6.2.0.bin */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		0483F71632672DDD0AB107E7 /* iosApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = iosApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		74A54166EC30340FDD381283 /* ggml-small.bin */ = {isa = PBXFileReference; lastKnownFileType = file; path = "Resources/ggml-small.bin"; sourceTree = "<group>"; };
+		D9887132175E4261A02D6681 /* ggml-silero-v6.2.0.bin */ = {isa = PBXFileReference; lastKnownFileType = file; path = "Resources/ggml-silero-v6.2.0.bin"; sourceTree = "<group>"; };
 		8F2C6A1E4B3D5E7091ABCDE1 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		995439431AB2706B7B59BFE8 /* iOSApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = iOSApp.swift; sourceTree = "<group>"; };
 		9EA764B65685B597BC2F9099 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
@@ -53,6 +55,7 @@
 				995439431AB2706B7B59BFE8 /* iOSApp.swift */,
 				9EA764B65685B597BC2F9099 /* ContentView.swift */,
 				74A54166EC30340FDD381283 /* ggml-small.bin */,
+				D9887132175E4261A02D6681 /* ggml-silero-v6.2.0.bin */,
 				8F2C6A1E4B3D5E7091ABCDE1 /* Info.plist */,
 			);
 			path = iosApp;
@@ -118,6 +121,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				AEB1D432CE2EB1F3141056AB /* ggml-small.bin in Resources */,
+				19DEA6E900AE45F0B5C75939 /* ggml-silero-v6.2.0.bin in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

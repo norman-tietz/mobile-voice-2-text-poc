@@ -62,3 +62,6 @@ DerivedData/
 ### Whisper model (downloaded by scripts/download-model.sh, not vendored) ###
 composeApp/src/androidMain/assets/models/*.bin
 iosApp/iosApp/Resources/*.bin
+
+### AI configuration
+/.claude/

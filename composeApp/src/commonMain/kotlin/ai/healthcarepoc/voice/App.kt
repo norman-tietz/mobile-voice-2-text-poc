@@ -3,9 +3,11 @@ package ai.healthcarepoc.voice
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -13,6 +15,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -25,10 +28,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.newSingleThreadContext
+
+enum class AsrEngine { WHISPER, NATIVE }
 
 sealed interface UiState {
     data object Idle : UiState
@@ -39,25 +47,82 @@ sealed interface UiState {
 }
 
 @Composable
+private fun EngineToggleButton(label: String, selected: Boolean, enabled: Boolean, onClick: () -> Unit) {
+    if (selected) {
+        Button(onClick = onClick, enabled = enabled) { Text(label) }
+    } else {
+        OutlinedButton(onClick = onClick, enabled = enabled) { Text(label) }
+    }
+}
+
+// Bundles the two Whisper-path components that must be constructed together (and fail
+// together) at session start: the segmenter (VAD-driven, real-time) and the
+// transcription session (slow, decoupled via segmentChannel - see startRecording()).
+// Retains native handles (engine, vad) so they can be released when the pipeline is disposed.
+private class WhisperPipeline(
+    val session: TranscriptionSession,
+    val segmenter: SpeechSegmenter,
+    private val engine: WhisperEngine,
+    private val vad: WhisperVad
+) {
+    fun release() {
+        engine.release()
+        vad.release()
+    }
+}
+
+@Composable
 fun App(
     audioCapture: AudioCapture,
     micPermission: MicPermission,
     modelPathProvider: ModelPathProvider,
-    nativeSampleRateHz: () -> Int
+    nativeSampleRateHz: () -> Int,
+    nativeAsr: NativeAsrEngine? = null
 ) {
     var uiState by remember { mutableStateOf<UiState>(UiState.Idle) }
     var transcript by remember { mutableStateOf(listOf<String>()) }
     val scope = remember { CoroutineScope(Dispatchers.Default) }
+    // Dispatchers.IO isn't accessible from commonMain (JVM/Native-only, internal here) - a
+    // dedicated single thread, entirely separate from Default's shared CPU-bound pool, gives
+    // the long-running blocking transcribe() call somewhere to run without starving Default's
+    // limited threads out from under segmenterJob. See consumerJob below for why this matters.
+    @OptIn(DelicateCoroutinesApi::class)
+    val transcribeDispatcher = remember { newSingleThreadContext("WhisperTranscribe") }
+    var selectedEngine by remember { mutableStateOf(AsrEngine.WHISPER) }
+    var whisperSegmentsShown by remember { mutableStateOf(0) }
+    val nativeAvailable = remember(nativeAsr) { nativeAsr?.isAvailable() ?: false }
+    KeepScreenOn(enabled = uiState == UiState.Recording)
 
-    // Loading the model can fail (missing/corrupt bundled file); session stays null
+    // Loading either model can fail (missing/corrupt bundled file); pipeline stays null
     // and an error state is shown instead of letting the app crash on first use.
-    val session = remember {
+    val pipeline = remember {
         runCatching {
             val engine = WhisperEngine(modelPathProvider.resolveModelPath())
-            TranscriptionSession(engine, PauseDetector(sampleRateHz = 16_000))
+            val vad = WhisperVad(modelPathProvider.resolveVadModelPath())
+            WhisperPipeline(TranscriptionSession(engine), SpeechSegmenter(vad, sampleRateHz = 16_000), engine, vad)
         }.onFailure { e ->
             uiState = UiState.Error(e.message ?: "Failed to load speech model")
         }.getOrNull()
+    }
+    DisposableEffect(pipeline) {
+        onDispose {
+            scope.cancel()
+            // If disposed while a recording is in flight (e.g. a config change happens exactly
+            // mid-recording), skip releasing the native handles here rather than risk a
+            // use-after-free against a still-running scope.launch{} coroutine that's mid-call
+            // into transcribe()/speechProbability() - those are synchronous native calls, not
+            // suspend functions, so cancelling scope cannot interrupt one already in progress.
+            // This leaks the handles in that rare case instead of crashing; ordinary disposal
+            // while idle (the common case) still releases correctly.
+            // transcribeDispatcher.close() is gated the same way: closing it while consumerJob
+            // is still running on it (e.g. mid in-flight transcribe() call) risks the coroutine
+            // hitting a rejected-execution error trying to continue on a closed dispatcher once
+            // that call returns - same leak-over-crash tradeoff as the handle release above.
+            if (uiState != UiState.Recording && uiState != UiState.Stopping) {
+                pipeline?.release()
+                transcribeDispatcher.close()
+            }
+        }
     }
 
     // Decouples audio capture from transcription. The capture thread (AudioCapture's reader
@@ -69,50 +134,144 @@ fun App(
     // enqueues samples (fast, non-blocking); a separate consumer coroutine drains the queue
     // and performs acceptAudio()/transcribe() sequentially, off the capture thread.
     var audioChannel by remember { mutableStateOf<Channel<FloatArray>?>(null) }
+    var segmentChannel by remember { mutableStateOf<Channel<FloatArray>?>(null) }
+    var segmenterJob by remember { mutableStateOf<Job?>(null) }
     var consumerJob by remember { mutableStateOf<Job?>(null) }
+    var nativeStartJob by remember { mutableStateOf<Job?>(null) }
 
     fun startRecording() {
-        debugLog("App.startRecording: entered, session=${if (session == null) "null" else "ready"}")
-        val activeSession = session ?: return
-        uiState = UiState.Recording
-        val channel = Channel<FloatArray>(Channel.UNLIMITED)
-        audioChannel = channel
-        consumerJob = scope.launch {
-            for (samples in channel) {
-                activeSession.acceptAudio(samples)
-                transcript = activeSession.segments
+        debugLog("App.startRecording: entered, engine=$selectedEngine")
+        when (selectedEngine) {
+            AsrEngine.WHISPER -> {
+                val activePipeline = pipeline ?: return
+                uiState = UiState.Recording
+
+                val audio = Channel<FloatArray>(Channel.UNLIMITED)
+                audioChannel = audio
+                val segments = Channel<FloatArray>(Channel.UNLIMITED)
+                segmentChannel = segments
+
+                // Stage 1: real-time segmenter. Only does VAD-driven boundary detection -
+                // never calls transcribe() - so it can't fall behind no matter how slow
+                // transcription is. This is what fixes segment boundaries being computed
+                // against a stale backlog (see the design spec's Evidence section).
+                segmenterJob = scope.launch {
+                    for (samples in audio) {
+                        activePipeline.segmenter.accept(samples).forEach { segment ->
+                            val result = segments.trySend(segment)
+                            if (result.isFailure) {
+                                debugLog("App: segmentChannel.trySend failed (channel closed?): $result")
+                            }
+                        }
+                    }
+                    activePipeline.segmenter.flush()?.let { segment ->
+                        segments.trySend(segment)
+                    }
+                    segments.close()
+                    debugLog("App: segmenter loop exiting (audioChannel closed)")
+                }
+
+                // Stage 2: transcribe consumer. Unchanged in spirit from before - just now
+                // fed from segmentChannel (already-finalized segments) instead of raw audio.
+                // Dispatched on transcribeDispatcher (its own dedicated thread), not the shared
+                // scope's Default: transcribe() is a long-running blocking native call (not a
+                // suspend function, so it never yields), and running it on Default's small
+                // CPU-bound pool would starve segmenterJob out of that same pool while a
+                // transcribe() call is in flight - reintroducing exactly the decode-timing
+                // coupling this two-stage pipeline exists to avoid, just via thread contention
+                // instead of a shared queue. Confirmed on-device: segments recorded while no
+                // transcribe() was in flight came out as one clean multi-second chunk; segments
+                // recorded while one was running got chopped to under a second, with visibly bursty
+                // (non-100ms-steady) chunk timestamps - and Whisper hallucinated "[MUSIK]"/"[P]" on
+                // the resulting short fragments.
+                consumerJob = scope.launch(transcribeDispatcher) {
+                    for (segment in segments) {
+                        activePipeline.session.transcribeSegment(segment)
+                        val allSegments = activePipeline.session.segments
+                        if (allSegments.size > whisperSegmentsShown) {
+                            transcript = transcript + allSegments.subList(whisperSegmentsShown, allSegments.size)
+                                .map { "[Whisper] $it" }
+                            whisperSegmentsShown = allSegments.size
+                        }
+                    }
+                    debugLog("App: transcribe consumer loop exiting (segmentChannel closed)")
+                }
+
+                audioCapture.start { samples ->
+                    val resampled = resampleTo16k(samples, nativeSampleRateHz())
+                    val result = audio.trySend(resampled)
+                    if (result.isFailure) {
+                        debugLog("App: audioChannel.trySend failed (channel closed?): $result")
+                    }
+                }
+                debugLog("App.startRecording: audioCapture.start() returned, uiState=Recording")
             }
-            debugLog("App: audio consumer loop exiting (channel closed)")
-        }
-        audioCapture.start { samples ->
-            val resampled = resampleTo16k(samples, nativeSampleRateHz())
-            val result = channel.trySend(resampled)
-            if (result.isFailure) {
-                debugLog("App: audioChannel.trySend failed (channel closed?): $result")
+            AsrEngine.NATIVE -> {
+                val engine = nativeAsr ?: return
+                uiState = UiState.Recording
+                nativeStartJob = scope.launch {
+                    runCatching {
+                        engine.start(
+                            onSegment = { text -> transcript = transcript + "[Native] $text" },
+                            onError = { message -> uiState = UiState.Error(message) }
+                        )
+                    }.onFailure { e ->
+                        uiState = UiState.Error(e.message ?: "Native recognizer failed to start")
+                    }
+                }
+                debugLog("App.startRecording: nativeAsr.start() launched, uiState=Recording")
             }
         }
-        debugLog("App.startRecording: audioCapture.start() returned, uiState=Recording")
     }
 
     suspend fun stopRecording() {
-        debugLog("App.stopRecording: entered")
-        val activeSession = session ?: return
-        val t0 = nowMs()
-        audioCapture.stop()
-        debugLog("App.stopRecording: audioCapture.stop() returned after ${nowMs() - t0}ms")
-        // Close the channel and wait for the consumer to finish processing everything already
-        // queued (including any transcribe() call currently in flight) before force-finalizing
-        // the pending buffer - otherwise stop() could race the consumer and finalize a stale or
-        // incomplete pending buffer.
-        val t1 = nowMs()
-        audioChannel?.close()
-        consumerJob?.join()
-        audioChannel = null
-        consumerJob = null
-        debugLog("App.stopRecording: audio consumer drained after ${nowMs() - t1}ms")
-        val t2 = nowMs()
-        transcript = activeSession.stop()
-        debugLog("App.stopRecording: activeSession.stop() returned after ${nowMs() - t2}ms, segments=${transcript.size}")
+        debugLog("App.stopRecording: entered, engine=$selectedEngine")
+        when (selectedEngine) {
+            AsrEngine.WHISPER -> {
+                val activePipeline = pipeline ?: return
+                val t0 = nowMs()
+                audioCapture.stop()
+                debugLog("App.stopRecording: audioCapture.stop() returned after ${nowMs() - t0}ms")
+                // Drain in pipeline order: audioChannel first (segmenterJob processes whatever was
+                // already captured, flushes its trailing buffer, then closes segmentChannel), then
+                // segmentChannel (consumerJob transcribes whatever the segmenter produced, including
+                // the flushed tail). Each join() only returns once its stage has genuinely finished,
+                // so this can't race a still-in-flight transcribe() call the way finalizing a shared
+                // buffer directly would.
+                val t1 = nowMs()
+                audioChannel?.close()
+                segmenterJob?.join()
+                segmenterJob = null
+                audioChannel = null
+                consumerJob?.join()
+                consumerJob = null
+                segmentChannel = null
+                debugLog("App.stopRecording: pipeline drained after ${nowMs() - t1}ms")
+                val t2 = nowMs()
+                activePipeline.session.stop()
+                // pipeline is reused (remember{}'d) across multiple Record/Stop cycles in the
+                // same app session, so the segmenter's buffer/VAD state must be cleared here -
+                // otherwise buffer grows unboundedly across recordings and the next recording's
+                // VAD trace starts contaminated by this one's tail, mirroring why session.stop()
+                // above resets the transcriber's context.
+                activePipeline.segmenter.reset()
+                val finalSegments = activePipeline.session.segments
+                if (finalSegments.size > whisperSegmentsShown) {
+                    transcript = transcript + finalSegments.subList(whisperSegmentsShown, finalSegments.size)
+                        .map { "[Whisper] $it" }
+                    whisperSegmentsShown = finalSegments.size
+                }
+                debugLog("App.stopRecording: session.stop() returned after ${nowMs() - t2}ms, segments=${finalSegments.size}")
+            }
+            AsrEngine.NATIVE -> {
+                val engine = nativeAsr ?: return
+                nativeStartJob?.join()
+                nativeStartJob = null
+                val t0 = nowMs()
+                engine.stop()
+                debugLog("App.stopRecording: nativeAsr.stop() returned after ${nowMs() - t0}ms")
+            }
+        }
         uiState = UiState.Idle
         debugLog("App.stopRecording: uiState=Idle")
     }
@@ -181,7 +340,7 @@ fun App(
 
     MaterialTheme {
         Column(
-            modifier = Modifier.fillMaxSize().padding(16.dp),
+            modifier = Modifier.fillMaxSize().safeDrawingPadding().padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
@@ -206,6 +365,20 @@ fun App(
             }
 
             if (uiState !is UiState.PermissionDenied && uiState !is UiState.Error) {
+                if (nativeAsr != null) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally)
+                    ) {
+                        val toggleEnabled = uiState == UiState.Idle
+                        EngineToggleButton("Whisper", selectedEngine == AsrEngine.WHISPER, toggleEnabled) {
+                            selectedEngine = AsrEngine.WHISPER
+                        }
+                        EngineToggleButton("Native", selectedEngine == AsrEngine.NATIVE, toggleEnabled && nativeAvailable) {
+                            selectedEngine = AsrEngine.NATIVE
+                        }
+                    }
+                }
                 Box(
                     modifier = Modifier.fillMaxWidth().padding(bottom = 24.dp),
                     contentAlignment = Alignment.Center

@@ -6,18 +6,37 @@
 #include <thread>
 #include "whisper.h"
 
+namespace {
+
+// Bundles the whisper_context with the previous segment's decoded tokens, so they can
+// be fed back in as wparams.prompt_tokens on the next transcribe() call - this is the
+// same "condition on previous text" pattern whisper.cpp's own stream example uses.
+// Carrying context across calls is what lets segment N+1 avoid starting blind (better
+// continuity, fewer restarts of mid-sentence context) instead of every pause-triggered
+// chunk being decoded in isolation.
+struct EngineState {
+    whisper_context *ctx;
+    std::vector<whisper_token> prevTokens;
+};
+
+} // namespace
+
 extern "C" JNIEXPORT jlong JNICALL
 Java_ai_healthcarepoc_voice_WhisperEngine_nativeInit(JNIEnv *env, jobject /*thiz*/, jstring modelPath) {
     const char *path = env->GetStringUTFChars(modelPath, nullptr);
     struct whisper_context_params cparams = whisper_context_default_params();
     struct whisper_context *ctx = whisper_init_from_file_with_params(path, cparams);
     env->ReleaseStringUTFChars(modelPath, path);
-    return reinterpret_cast<jlong>(ctx);
+    if (ctx == nullptr) {
+        return 0;
+    }
+    return reinterpret_cast<jlong>(new EngineState{ctx, {}});
 }
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_ai_healthcarepoc_voice_WhisperEngine_nativeTranscribe(JNIEnv *env, jobject /*thiz*/, jlong handle, jfloatArray samples) {
-    auto *ctx = reinterpret_cast<struct whisper_context *>(handle);
+    auto *state = reinterpret_cast<EngineState *>(handle);
+    auto *ctx = state->ctx;
 
     jsize n = env->GetArrayLength(samples);
     std::vector<float> buffer(n);
@@ -36,6 +55,10 @@ Java_ai_healthcarepoc_voice_WhisperEngine_nativeTranscribe(JNIEnv *env, jobject 
     wparams.print_realtime = false;
     wparams.n_threads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
     wparams.max_tokens = 224;
+    if (!state->prevTokens.empty()) {
+        wparams.prompt_tokens = state->prevTokens.data();
+        wparams.prompt_n_tokens = static_cast<int>(state->prevTokens.size());
+    }
 
     // Left at its default (0), audio_ctx makes whisper.cpp always encode the
     // model's full 30s/1500-frame context no matter how short the input is, so
@@ -62,11 +85,26 @@ Java_ai_healthcarepoc_voice_WhisperEngine_nativeTranscribe(JNIEnv *env, jobject 
         result += whisper_full_get_segment_text(ctx, i);
     }
 
+    state->prevTokens.clear();
+    for (int i = 0; i < n_segments; ++i) {
+        const int token_count = whisper_full_n_tokens(ctx, i);
+        for (int j = 0; j < token_count; ++j) {
+            state->prevTokens.push_back(whisper_full_get_token_id(ctx, i, j));
+        }
+    }
+
     return env->NewStringUTF(result.c_str());
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_ai_healthcarepoc_voice_WhisperEngine_nativeResetContext(JNIEnv *env, jobject /*thiz*/, jlong handle) {
+    auto *state = reinterpret_cast<EngineState *>(handle);
+    state->prevTokens.clear();
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_ai_healthcarepoc_voice_WhisperEngine_nativeRelease(JNIEnv *env, jobject /*thiz*/, jlong handle) {
-    auto *ctx = reinterpret_cast<struct whisper_context *>(handle);
-    whisper_free(ctx);
+    auto *state = reinterpret_cast<EngineState *>(handle);
+    whisper_free(state->ctx);
+    delete state;
 }
