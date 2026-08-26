@@ -30,6 +30,7 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 
@@ -95,7 +96,19 @@ fun App(
         }.getOrNull()
     }
     DisposableEffect(pipeline) {
-        onDispose { pipeline?.release() }
+        onDispose {
+            scope.cancel()
+            // If disposed while a recording is in flight (e.g. a config change happens exactly
+            // mid-recording), skip releasing the native handles here rather than risk a
+            // use-after-free against a still-running scope.launch{} coroutine that's mid-call
+            // into transcribe()/speechProbability() - those are synchronous native calls, not
+            // suspend functions, so cancelling scope cannot interrupt one already in progress.
+            // This leaks the handles in that rare case instead of crashing; ordinary disposal
+            // while idle (the common case) still releases correctly.
+            if (uiState != UiState.Recording && uiState != UiState.Stopping) {
+                pipeline?.release()
+            }
+        }
     }
 
     // Decouples audio capture from transcription. The capture thread (AudioCapture's reader

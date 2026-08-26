@@ -28,20 +28,24 @@ reverted in favor of whisper.cpp.
 ## How it works
 
 ```
-AudioCapture (mic) → resampleTo16k → TranscriptionSession → PauseDetector
-                                            ↓
-                                      WhisperEngine (whisper.cpp)
-                                            ↓
-                                    Compose UI (transcript segments)
+AudioCapture (mic) → resampleTo16k → SpeechSegmenter (WhisperVad) → TranscriptionSession
+                                                                            ↓
+                                                                  WhisperEngine (whisper.cpp)
+                                                                            ↓
+                                                                  Compose UI (transcript segments)
 ```
 
 - **`AudioCapture`** (`expect`/`actual`) — captures microphone audio.
   Android via `AudioRecord`, iOS via `AVAudioEngine`.
-- **`PauseDetector`** — RMS-based trailing-silence detection; signals a
-  pause once ~700ms of near-silence is observed.
-- **`TranscriptionSession`** — buffers audio and triggers transcription of
-  the buffered segment whenever a pause is detected, or when recording
-  stops with audio still pending.
+- **`SpeechSegmenter`** — VAD-probability-driven trailing-silence detection;
+  feeds each audio chunk to `WhisperVad` (a thin wrapper over whisper.cpp's
+  Silero VAD, `expect`/`actual`) for a per-chunk speech probability, and
+  applies hysteresis bookkeeping (entering speech requires crossing a high
+  threshold, leaving it requires ~500ms of trailing audio below a lower
+  threshold) to decide segment boundaries in real time.
+- **`TranscriptionSession`** — receives already-finalized segments from
+  `SpeechSegmenter` and triggers transcription of each one, or of whatever
+  is still pending when recording stops.
 - **`WhisperEngine`** (`expect`/`actual`) — runs whisper.cpp natively.
   Android via a JNI/CMake binding, iOS via Kotlin/Native cinterop. Both
   bind the same vendored `whisper.cpp` C library and the same bundled
@@ -120,7 +124,7 @@ script above.
 The first build compiles whisper.cpp from source via CMake/NDK for
 `arm64-v8a`, which takes a few minutes; subsequent builds are incremental.
 
-Run the unit tests (pure-Kotlin `PauseDetector`/`TranscriptionSession`
+Run the unit tests (pure-Kotlin `SpeechSegmenter`/`TranscriptionSession`
 logic):
 
 ```bash
@@ -160,7 +164,7 @@ Intel-simulator targets are not supported — see Known limitations).
 
 ```
 composeApp/
-  src/commonMain/    shared Kotlin: UI, TranscriptionSession, PauseDetector,
+  src/commonMain/    shared Kotlin: UI, TranscriptionSession, SpeechSegmenter,
                       expect declarations
   src/androidMain/    Android actuals + JNI/CMake bridge to whisper.cpp
   src/iosMain/        iOS actuals + Kotlin/Native cinterop bridge
