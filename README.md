@@ -77,9 +77,11 @@ transcript line is prefixed with the engine that produced it
   `targetSdk` 36
 - iOS deployment target 15.0
 - [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (vendored as a git
-  submodule, MIT-licensed), ggml multilingual `small` model (~466 MiB,
-  MIT-licensed, from
+  submodule, MIT-licensed), ggml multilingual `small` model, q8_0-quantized
+  to ~252 MiB (from the ~466 MiB fp16 original, MIT-licensed, from
   [`ggerganov/whisper.cpp` on Hugging Face](https://huggingface.co/ggerganov/whisper.cpp))
+  by `scripts/download-model.sh` - roughly half the decode time with no
+  measurable quality loss
 
 ## Prerequisites
 
@@ -103,10 +105,12 @@ git submodule update --init
 ```
 
 The first script downloads the ~466 MiB German multilingual `ggml-small.bin`
-model and places a copy at both platforms' expected asset locations
-(`composeApp/src/androidMain/assets/models/ggml-small.bin` and
-`iosApp/iosApp/Resources/ggml-small.bin`). The model is gitignored — every
-fresh checkout needs to run this script once.
+model, quantizes it to q8_0 (~252 MiB, via a locally-built `whisper-quantize`
+from the vendored whisper.cpp - requires `cmake` on `PATH`, or point at one
+with `CMAKE=/path/to/cmake`), and places a copy at both platforms' expected
+asset locations (`composeApp/src/androidMain/assets/models/ggml-small.bin`
+and `iosApp/iosApp/Resources/ggml-small.bin`). The model is gitignored —
+every fresh checkout needs to run this script once.
 
 The second script downloads the small Silero VAD model
 (`ggml-silero-v6.2.0.bin`, a few MB) used for real-time speech/silence
