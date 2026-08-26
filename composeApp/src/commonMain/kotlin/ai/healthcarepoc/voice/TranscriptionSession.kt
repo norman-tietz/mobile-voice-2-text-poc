@@ -9,48 +9,26 @@ interface Transcriber {
     fun resetContext()
 }
 
-class TranscriptionSession(
-    private val transcriber: Transcriber,
-    private val pauseDetector: PauseDetector
-) {
+// Just the transcribe stage of the pipeline - segmentation (deciding where a segment
+// starts/ends) is SpeechSegmenter's job, running in a separate, real-time coroutine so
+// it's never coupled to how long transcribe() takes. See docs/superpowers/specs/
+// 2026-08-25-vad-segmentation-design.md.
+class TranscriptionSession(private val transcriber: Transcriber) {
     private val finalizedSegments = mutableListOf<String>()
-    private val pendingSamples = mutableListOf<Float>()
 
     val segments: List<String> get() = finalizedSegments.toList()
 
-    fun acceptAudio(samples: FloatArray) {
-        pendingSamples.addAll(samples.toList())
-        debugLog("TranscriptionSession.acceptAudio: +${samples.size} samples, pending=${pendingSamples.size}")
-        if (pauseDetector.accept(samples)) {
-            debugLog("TranscriptionSession.acceptAudio: pause detected, finalizing segment")
-            finalizeSegment()
-        }
-    }
-
-    fun stop(): List<String> {
-        debugLog("TranscriptionSession.stop: entered, pending=${pendingSamples.size}")
-        if (pendingSamples.isNotEmpty()) {
-            finalizeSegment()
-        }
-        transcriber.resetContext()
-        debugLog("TranscriptionSession.stop: returning ${segments.size} segments")
-        return segments
-    }
-
-    private fun finalizeSegment() {
-        if (!pauseDetector.hadSpeech) {
-            debugLog("TranscriptionSession.finalizeSegment: skipping transcribe(), ${pendingSamples.size} samples never crossed the speech threshold")
-            pendingSamples.clear()
-            pauseDetector.reset()
-            return
-        }
-        debugLog("TranscriptionSession.finalizeSegment: starting transcribe() on ${pendingSamples.size} samples")
+    fun transcribeSegment(samples: FloatArray) {
+        debugLog("TranscriptionSession.transcribeSegment: starting transcribe() on ${samples.size} samples")
         val startMs = nowMs()
-        val text = transcriber.transcribe(pendingSamples.toFloatArray())
+        val text = transcriber.transcribe(samples)
         val elapsedMs = nowMs() - startMs
-        debugLog("TranscriptionSession.finalizeSegment: transcribe() returned after ${elapsedMs}ms, textLength=${text.length}, text=\"$text\"")
+        debugLog("TranscriptionSession.transcribeSegment: transcribe() returned after ${elapsedMs}ms, textLength=${text.length}, text=\"$text\"")
         finalizedSegments.add(text)
-        pendingSamples.clear()
-        pauseDetector.reset()
+    }
+
+    fun stop() {
+        debugLog("TranscriptionSession.stop: resetting transcriber context")
+        transcriber.resetContext()
     }
 }
