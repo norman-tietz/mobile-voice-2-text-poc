@@ -20,7 +20,23 @@ actual class MicPermission actual constructor(private val context: ApplicationCo
 
     actual suspend fun request(): PermissionStatus = suspendCancellableCoroutine { continuation ->
         debugLog("MicPermission.request: entered, requesting RECORD_AUDIO")
+        // A second concurrent call would otherwise silently overwrite pendingContinuation,
+        // leaking the first caller's coroutine forever (onRequestPermissionsResult only ever
+        // resumes whichever continuation is currently referenced). Failing loudly surfaces a
+        // real bug instead of an invisible permanent hang.
+        check(PermissionRequestBridge.pendingContinuation == null) {
+            "MicPermission.request() called while another request is already pending"
+        }
         PermissionRequestBridge.pendingContinuation = continuation
+        // If this coroutine is cancelled while the system dialog is still up (e.g. the
+        // composition is disposed by a config change), clear the reference - otherwise it keeps
+        // pointing at a continuation that can never be resumed, permanently blocking any future
+        // request() via the check above until the dialog happens to resolve and overwrite it.
+        continuation.invokeOnCancellation {
+            if (PermissionRequestBridge.pendingContinuation === continuation) {
+                PermissionRequestBridge.pendingContinuation = null
+            }
+        }
         context.requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), PermissionRequestBridge.REQUEST_CODE)
     }
 

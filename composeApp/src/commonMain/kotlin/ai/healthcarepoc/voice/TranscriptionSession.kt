@@ -45,6 +45,12 @@ class TranscriptionSession(
     fun stop() {
         debugLog("TranscriptionSession.stop: resetting transcriber context")
         transcriber.resetContext()
+        // pipeline (and this session) is reused across every Record/Stop cycle in the app
+        // session - without this, finalizedSegments (and the O(n) copy .segments does on every
+        // read) grows unboundedly for segments that have already been flushed into the UI and
+        // serve no further purpose. Callers must read segments/flush them before calling stop(),
+        // since this clears them.
+        finalizedSegments.clear()
     }
 }
 

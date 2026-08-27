@@ -81,7 +81,20 @@ Java_ai_healthcarepoc_voice_WhisperEngine_nativeTranscribe(JNIEnv *env, jobject 
     const int wanted_ctx = std::max(min_ctx, static_cast<int>(std::ceil(seconds * frames_per_sec)) + static_cast<int>(3 * frames_per_sec));
     wparams.audio_ctx = std::min(max_ctx, wanted_ctx);
 
-    whisper_full(ctx, wparams, buffer.data(), static_cast<int>(buffer.size()));
+    const int full_result = whisper_full(ctx, wparams, buffer.data(), static_cast<int>(buffer.size()));
+    if (full_result != 0) {
+        // Previously ignored: a decode failure left result_all empty, so the code below read
+        // that as "zero segments" and returned a successful empty transcription - silently
+        // dropping speech and, worse, wiping the carried-over prompt-token context below on a
+        // failure that had nothing to do with silence. Throwing here instead surfaces a real
+        // error to Kotlin (WhisperEngine.transcribe()'s caller is a coroutine covered by
+        // App.kt's CoroutineExceptionHandler) and leaves prevTokens untouched via this early
+        // return, so the next segment isn't decoded blind either.
+        jclass exceptionClass = env->FindClass("java/lang/RuntimeException");
+        std::string message = "whisper_full failed with code " + std::to_string(full_result);
+        env->ThrowNew(exceptionClass, message.c_str());
+        return nullptr;
+    }
 
     std::string result;
     int n_segments = whisper_full_n_segments(ctx);

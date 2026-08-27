@@ -31,10 +31,12 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
@@ -44,6 +46,11 @@ enum class AsrEngine { WHISPER, NATIVE }
 
 sealed interface UiState {
     data object Idle : UiState
+    // Synchronous gate between a Record tap and startRecording() actually setting Recording -
+    // covers the permission-check/request suspension, which can take arbitrarily long (a full
+    // system dialog). Without a distinct state here, uiState reads Idle for that whole window,
+    // so a second rapid tap would see Idle too and launch a second concurrent pipeline.
+    data object Starting : UiState
     data object Recording : UiState
     data object Stopping : UiState
     data object PermissionDenied : UiState
@@ -94,18 +101,33 @@ fun App(
     audioCapture: AudioCapture,
     micPermission: MicPermission,
     modelPathProvider: ModelPathProvider,
-    nativeSampleRateHz: () -> Int,
     nativeAsr: NativeAsrEngine? = null
 ) {
     var uiState by remember { mutableStateOf<UiState>(UiState.Idle) }
     var transcript by remember { mutableStateOf(listOf<TranscriptEntry>()) }
-    val scope = remember { CoroutineScope(Dispatchers.Default) }
+    // SupervisorJob so one child coroutine throwing (e.g. AudioCapture.start() on a busy mic,
+    // or a native transcribe()/speechProbability() call) can't cancel its siblings or the scope
+    // itself - a plain Job would propagate the failure upward and permanently kill every future
+    // scope.launch{} for the rest of the app's life, since a cancelled scope rejects new
+    // coroutines immediately. The handler surfaces the failure instead of leaving it silently
+    // swallowed (a coroutine's default behavior with no other handler installed).
+    val scope = remember {
+        CoroutineScope(
+            Dispatchers.Default + SupervisorJob() + CoroutineExceptionHandler { _, throwable ->
+                debugLog("App: uncaught coroutine exception: $throwable")
+                uiState = UiState.Error(throwable.message ?: "Unexpected error")
+            }
+        )
+    }
     // Dispatchers.IO isn't accessible from commonMain (JVM/Native-only, internal here) - a
     // dedicated single thread, entirely separate from Default's shared CPU-bound pool, gives
     // the long-running blocking transcribe() call somewhere to run without starving Default's
     // limited threads out from under segmenterJob. See consumerJob below for why this matters.
     @OptIn(DelicateCoroutinesApi::class)
     val transcribeDispatcher = remember { newSingleThreadContext("WhisperTranscribe") }
+    // Tracks a stopRecording() call in flight, so the DisposableEffect below can wait for it
+    // to actually finish instead of cancelling it out from under itself - see its onDispose.
+    var stopRecordingJob by remember { mutableStateOf<Job?>(null) }
     var selectedEngine by remember { mutableStateOf(AsrEngine.WHISPER) }
     var whisperSegmentsShown by remember { mutableStateOf(0) }
     val nativeAvailable = remember(nativeAsr) { nativeAsr?.isAvailable() ?: false }
@@ -139,19 +161,31 @@ fun App(
     }
     DisposableEffect(pipeline) {
         onDispose {
-            scope.cancel()
-            // If disposed while a recording is in flight (e.g. a config change happens exactly
-            // mid-recording), skip releasing the native handles here rather than risk a
-            // use-after-free against a still-running scope.launch{} coroutine that's mid-call
-            // into transcribe()/speechProbability() - those are synchronous native calls, not
-            // suspend functions, so cancelling scope cannot interrupt one already in progress.
-            // This leaks the handles in that rare case instead of crashing; ordinary disposal
-            // while idle (the common case) still releases correctly.
-            // transcribeDispatcher.close() is gated the same way: closing it while consumerJob
-            // is still running on it (e.g. mid in-flight transcribe() call) risks the coroutine
-            // hitting a rejected-execution error trying to continue on a closed dispatcher once
-            // that call returns - same leak-over-crash tradeoff as the handle release above.
-            if (uiState != UiState.Recording && uiState != UiState.Stopping) {
+            val pendingStop = stopRecordingJob
+            if (pendingStop != null && !pendingStop.isCompleted) {
+                // A stopRecording() call is already in flight on `scope` (e.g. an Android
+                // rotation fired onPause -> onBackground moments before this runs). Cancelling
+                // scope now would kill that coroutine at whatever suspension point it's at,
+                // freeze uiState at Stopping forever (it only reaches Idle at the very end of
+                // stopRecording()), and make the check below always skip release - a guaranteed
+                // leak on every single rotation-while-recording, not just a rare race. Instead,
+                // let it actually finish - its own join()s on segmenterJob/consumerJob already
+                // wait out anything in-flight - then release once nothing can be mid a
+                // synchronous native call, and only then cancel scope.
+                scope.launch {
+                    pendingStop.join()
+                    pipeline?.release()
+                    transcribeDispatcher.close()
+                    scope.cancel()
+                }
+            } else if (uiState != UiState.Recording) {
+                // No stop in flight. Recording with no pending stop (backgrounded via some path
+                // that bypasses both the button and the lifecycle observer) is the one remaining
+                // case where a synchronous native call could genuinely be in progress with no
+                // way to wait it out from here - leak rather than risk a use-after-free, same
+                // tradeoff as before. Every other state (Idle, Starting, PermissionDenied,
+                // Error, or Stopping that already completed) is safe to release immediately.
+                scope.cancel()
                 pipeline?.release()
                 transcribeDispatcher.close()
             }
@@ -198,19 +232,26 @@ fun App(
                 // transcription is. This is what fixes segment boundaries being computed
                 // against a stale backlog (see the design spec's Evidence section).
                 segmenterJob = scope.launch {
-                    for (samples in audio) {
-                        activePipeline.segmenter.accept(samples).forEach { segment ->
-                            val result = segments.trySend(TimedSegment(segment, nowMs()))
-                            if (result.isFailure) {
-                                debugLog("App: segmentChannel.trySend failed (channel closed?): $result")
+                    // segments.close() must run even if accept()/flush() throws - otherwise
+                    // consumerJob's `for (timedSegment in segments)` below waits on a channel
+                    // that will never close, and stopRecording()'s consumerJob?.join() hangs
+                    // forever with uiState stuck at Stopping.
+                    try {
+                        for (samples in audio) {
+                            activePipeline.segmenter.accept(samples).forEach { segment ->
+                                val result = segments.trySend(TimedSegment(segment, nowMs()))
+                                if (result.isFailure) {
+                                    debugLog("App: segmentChannel.trySend failed (channel closed?): $result")
+                                }
                             }
                         }
+                        activePipeline.segmenter.flush()?.let { segment ->
+                            segments.trySend(TimedSegment(segment, nowMs()))
+                        }
+                    } finally {
+                        segments.close()
+                        debugLog("App: segmenter loop exiting (audioChannel closed)")
                     }
-                    activePipeline.segmenter.flush()?.let { segment ->
-                        segments.trySend(TimedSegment(segment, nowMs()))
-                    }
-                    segments.close()
-                    debugLog("App: segmenter loop exiting (audioChannel closed)")
                 }
 
                 // Stage 2: transcribe consumer. Unchanged in spirit from before - just now
@@ -250,10 +291,16 @@ fun App(
                 }
 
                 audioCapture.start { samples ->
-                    val resampled = resampleTo16k(samples, nativeSampleRateHz())
-                    val result = audio.trySend(resampled)
-                    if (result.isFailure) {
-                        debugLog("App: audioChannel.trySend failed (channel closed?): $result")
+                    val resampled = resampleTo16k(samples, audioCapture.sampleRateHz)
+                    // resampleTo16k returns an empty array for a degenerate/invalid source rate
+                    // (see its own guard) rather than throwing on this non-coroutine callback
+                    // thread - skip enqueueing it instead of letting an empty buffer reach the
+                    // segmenter/VAD.
+                    if (resampled.isNotEmpty()) {
+                        val result = audio.trySend(resampled)
+                        if (result.isFailure) {
+                            debugLog("App: audioChannel.trySend failed (channel closed?): $result")
+                        }
                     }
                 }
                 debugLog("App.startRecording: audioCapture.start() returned, uiState=Recording")
@@ -300,19 +347,22 @@ fun App(
                 segmentChannel = null
                 debugLog("App.stopRecording: pipeline drained after ${nowMs() - t1}ms")
                 val t2 = nowMs()
+                // Must read/flush segments before session.stop() below, which clears them.
+                val finalSegments = activePipeline.session.segments
+                if (finalSegments.size > whisperSegmentsShown) {
+                    transcript = transcript + finalSegments.subList(whisperSegmentsShown, finalSegments.size)
+                        .map { TranscriptEntry.Segment("Whisper", it) }
+                }
                 activePipeline.session.stop()
                 // pipeline is reused (remember{}'d) across multiple Record/Stop cycles in the
                 // same app session, so the segmenter's buffer/VAD state must be cleared here -
                 // otherwise buffer grows unboundedly across recordings and the next recording's
                 // VAD trace starts contaminated by this one's tail, mirroring why session.stop()
-                // above resets the transcriber's context.
+                // above resets the transcriber's context and finalizedSegments.
                 activePipeline.segmenter.reset()
-                val finalSegments = activePipeline.session.segments
-                if (finalSegments.size > whisperSegmentsShown) {
-                    transcript = transcript + finalSegments.subList(whisperSegmentsShown, finalSegments.size)
-                        .map { TranscriptEntry.Segment("Whisper", it) }
-                    whisperSegmentsShown = finalSegments.size
-                }
+                // finalizedSegments was just cleared by session.stop() above, so the next
+                // recording's segments start renumbering from zero too.
+                whisperSegmentsShown = 0
                 debugLog("App.stopRecording: session.stop() returned after ${nowMs() - t2}ms, segments=${finalSegments.size}")
             }
             AsrEngine.NATIVE -> {
@@ -358,7 +408,7 @@ fun App(
                 // backgrounds the app and taps Stop right as it resumes) can't also see
                 // uiState==Recording and launch its own concurrent stopRecording().
                 uiState = UiState.Stopping
-                scope.launch { stopRecording() }
+                stopRecordingJob = scope.launch { stopRecording() }
             }
         })
     }
@@ -379,13 +429,19 @@ fun App(
                 // internal synchronization) and can fire two overlapping calls into the same
                 // non-reentrant native whisper_context, crashing the process.
                 uiState = UiState.Stopping
-                scope.launch {
+                stopRecordingJob = scope.launch {
                     debugLog("App: Stop click -> launching stopRecording()")
                     stopRecording()
                     debugLog("App: stopRecording() coroutine completed")
                 }
             }
             UiState.Idle -> {
+                // Mirrors the Stop branch's synchronous gate above: flip uiState before
+                // launching so a second rapid tap - arriving anywhere in the permission
+                // check/request window below, which can suspend for an entire system dialog -
+                // sees Starting instead of Idle and falls through to the no-op branch, instead
+                // of also matching UiState.Idle and starting a second concurrent pipeline.
+                uiState = UiState.Starting
                 scope.launch {
                     val status = micPermission.status()
                     debugLog("App: Record click -> micPermission.status()=$status")
@@ -402,7 +458,7 @@ fun App(
                     }
                 }
             }
-            UiState.Stopping, UiState.PermissionDenied, is UiState.Error -> Unit
+            UiState.Starting, UiState.Stopping, UiState.PermissionDenied, is UiState.Error -> Unit
         }
     }
 
@@ -476,6 +532,7 @@ fun App(
                         Text(
                             when (uiState) {
                                 UiState.Recording -> "Stop"
+                                UiState.Starting -> "Starting…"
                                 UiState.Stopping -> "Stopping…"
                                 else -> "Record"
                             },

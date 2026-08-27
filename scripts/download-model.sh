@@ -16,7 +16,9 @@ IOS_DEST="iosApp/iosApp/Resources/ggml-small.bin"
 mkdir -p "$(dirname "$ANDROID_DEST")" "$(dirname "$IOS_DEST")"
 
 if [ ! -f "$ANDROID_DEST" ]; then
-    curl -L "$MODEL_URL" -o "$RAW_MODEL"
+    # --fail: without it curl exits 0 even on an HTTP error page, which whisper-quantize below
+    # would then choke on - --fail turns that into a clear curl error instead.
+    curl --fail -L "$MODEL_URL" -o "$RAW_MODEL"
 
     # Quantized to q8_0: roughly half the size and decode time of the raw fp16 model, with
     # output confirmed identical on whisper.cpp's own jfk.wav sample - see App.kt's on-screen

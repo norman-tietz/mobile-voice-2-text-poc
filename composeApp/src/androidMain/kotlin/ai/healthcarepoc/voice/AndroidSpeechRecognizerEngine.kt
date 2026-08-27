@@ -19,6 +19,13 @@ class AndroidSpeechRecognizerEngine(private val context: Context) : NativeAsrEng
     private var segmentCallback: ((String) -> Unit)? = null
     private var errorCallback: ((String) -> Unit)? = null
     private var stopSignal: CompletableDeferred<Unit>? = null
+    // Incremented on every start(). Each RecognitionListener instance closes over the
+    // generation it was created for and ignores its own callbacks once this no longer matches -
+    // a callback the just-destroyed recognizer already posted to the main looper before stop()'s
+    // teardown ran would otherwise still fire, read the NEW generation's active/stopSignal state,
+    // and misapply itself (e.g. calling startListening() on the new recognizer while it's already
+    // listening, or appending stale text to the new recording's transcript).
+    private var generation = 0
 
     override fun isAvailable(): Boolean =
         Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
@@ -31,14 +38,25 @@ class AndroidSpeechRecognizerEngine(private val context: Context) : NativeAsrEng
             return
         }
         withContext(Dispatchers.Main) {
+            val myGeneration = ++generation
             this@AndroidSpeechRecognizerEngine.segmentCallback = onSegment
             this@AndroidSpeechRecognizerEngine.errorCallback = onError
             active = true
-            val r = SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
-            recognizer = r
-            r.setRecognitionListener(listener)
-            debugLog("AndroidSpeechRecognizerEngine.start: recognizer created, starting listening")
-            r.startListening(buildIntent())
+            try {
+                val r = SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
+                recognizer = r
+                r.setRecognitionListener(createListener(myGeneration))
+                debugLog("AndroidSpeechRecognizerEngine.start: recognizer created, starting listening")
+                r.startListening(buildIntent())
+            } catch (e: Throwable) {
+                // Roll back to the same clean state stop()'s !active branch expects - otherwise
+                // active stays true with recognizer null forever, and a later stop() call would
+                // take the active branch, call stopListening() on null, and block for the full
+                // 5-second timeout waiting for a callback that can never arrive.
+                active = false
+                recognizer = null
+                throw e
+            }
         }
     }
 
@@ -83,8 +101,17 @@ class AndroidSpeechRecognizerEngine(private val context: Context) : NativeAsrEng
             putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
         }
 
-    private val listener = object : RecognitionListener {
+    // A fresh listener per start() call (not a single shared instance) so each one can close
+    // over the generation it belongs to and ignore its own callbacks once stale - see the
+    // `generation` field comment above.
+    private fun createListener(myGeneration: Int): RecognitionListener = object : RecognitionListener {
+        private fun isStale() = myGeneration != generation
+
         override fun onResults(results: Bundle) {
+            if (isStale()) {
+                debugLog("AndroidSpeechRecognizerEngine.onResults: stale generation $myGeneration (current $generation), ignoring")
+                return
+            }
             val text = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty()
             debugLog("AndroidSpeechRecognizerEngine.onResults: active=$active, textLength=${text.length}")
             if (text.isNotEmpty()) {
@@ -100,6 +127,10 @@ class AndroidSpeechRecognizerEngine(private val context: Context) : NativeAsrEng
         }
 
         override fun onError(error: Int) {
+            if (isStale()) {
+                debugLog("AndroidSpeechRecognizerEngine.onError: stale generation $myGeneration (current $generation), ignoring")
+                return
+            }
             debugLog("AndroidSpeechRecognizerEngine.onError: code=$error, active=$active")
             val signal = stopSignal
             if (signal != null) {

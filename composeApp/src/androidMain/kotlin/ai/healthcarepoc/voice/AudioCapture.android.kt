@@ -7,7 +7,7 @@ import android.media.MediaRecorder
 import kotlin.concurrent.thread
 
 actual class AudioCapture {
-    private val sampleRate = 16_000
+    actual val sampleRateHz = 16_000
     private var record: AudioRecord? = null
     private var recordingThread: Thread? = null
     @Volatile private var isRecording = false
@@ -15,15 +15,15 @@ actual class AudioCapture {
     @SuppressLint("MissingPermission")
     actual fun start(onSamples: (FloatArray) -> Unit) {
         val minBufferSize = AudioRecord.getMinBufferSize(
-            sampleRate,
+            sampleRateHz,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT
         )
-        val bufferSize = maxOf(minBufferSize, sampleRate / 5) // ~100ms floor
+        val bufferSize = maxOf(minBufferSize, sampleRateHz / 5) // ~100ms floor
 
         val audioRecord = AudioRecord(
             MediaRecorder.AudioSource.VOICE_RECOGNITION,
-            sampleRate,
+            sampleRateHz,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
             bufferSize

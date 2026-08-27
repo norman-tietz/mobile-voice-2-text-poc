@@ -90,9 +90,16 @@ actual class WhisperEngine actual constructor(modelPath: String) : Transcriber {
         val wantedCtx = max(minCtx, ceil(seconds * framesPerSec).toInt() + (3 * framesPerSec).toInt())
         params.audio_ctx = min(maxCtx, wantedCtx)
 
-        samples.usePinned { pinned ->
+        val fullResult = samples.usePinned { pinned ->
             whisper_full(ctx, params.readValue(), pinned.addressOf(0), samples.size)
         }
+        // Previously ignored: a decode failure leaves the context with zero segments, which the
+        // code below read as "zero segments" and returned as a successful empty transcription -
+        // silently dropping speech and, worse, wiping prevTokens below on a failure that had
+        // nothing to do with silence. Throwing here surfaces a real error (transcribe()'s caller
+        // is consumerJob, a coroutine covered by App.kt's CoroutineExceptionHandler) and leaves
+        // prevTokens untouched, so the next segment isn't decoded blind either.
+        check(fullResult == 0) { "whisper_full failed with code $fullResult" }
 
         val segmentCount = whisper_full_n_segments(ctx)
         val text = buildString {

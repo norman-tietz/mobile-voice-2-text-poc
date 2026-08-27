@@ -12,7 +12,6 @@ class MainActivity : ComponentActivity() {
                 audioCapture = AudioCapture(),
                 micPermission = MicPermission(this),
                 modelPathProvider = ModelPathProvider(this),
-                nativeSampleRateHz = { 16_000 },
                 nativeAsr = AndroidSpeechRecognizerEngine(applicationContext)
             )
         }

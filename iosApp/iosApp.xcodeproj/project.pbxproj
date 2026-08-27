@@ -292,12 +292,15 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				LIBRARY_SEARCH_PATHS = (
+				"LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" = (
 					"$(inherited)",
 					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-sim/src/Release-iphonesimulator",
 					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-sim/ggml/src/Release-iphonesimulator",
 					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-sim/ggml/src/ggml-blas/Release-iphonesimulator",
 					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-sim/ggml/src/ggml-metal/Release-iphonesimulator",
+				);
+				"LIBRARY_SEARCH_PATHS[sdk=iphoneos*]" = (
+					"$(inherited)",
 					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-device/src/Release-iphoneos",
 					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-device/ggml/src/Release-iphoneos",
 					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-device/ggml/src/ggml-blas/Release-iphoneos",
@@ -346,12 +349,15 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				LIBRARY_SEARCH_PATHS = (
+				"LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" = (
 					"$(inherited)",
 					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-sim/src/Release-iphonesimulator",
 					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-sim/ggml/src/Release-iphonesimulator",
 					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-sim/ggml/src/ggml-blas/Release-iphonesimulator",
 					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-sim/ggml/src/ggml-metal/Release-iphonesimulator",
+				);
+				"LIBRARY_SEARCH_PATHS[sdk=iphoneos*]" = (
+					"$(inherited)",
 					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-device/src/Release-iphoneos",
 					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-device/ggml/src/Release-iphoneos",
 					"$(SRCROOT)/../third_party/whisper.cpp/build-ios-device/ggml/src/ggml-blas/Release-iphoneos",

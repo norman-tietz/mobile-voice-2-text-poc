@@ -63,4 +63,15 @@ class TranscriptionSessionTest {
 
         assertEquals(1, transcriber.resetContextCalls)
     }
+
+    @Test
+    fun `stop clears finalized segments so they don't accumulate across recordings`() {
+        val transcriber = FakeTranscriber(mutableListOf("erster satz"))
+        val session = TranscriptionSession(transcriber)
+        session.transcribeSegment(chunk(100, 0.5f))
+
+        session.stop()
+
+        assertEquals(emptyList(), session.segments)
+    }
 }
