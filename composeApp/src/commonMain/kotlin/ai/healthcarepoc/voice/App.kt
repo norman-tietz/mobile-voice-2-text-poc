@@ -17,6 +17,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -272,12 +273,17 @@ fun App(
     var timeToFirstSegmentMs by remember { mutableStateOf<Long?>(null) }
     var segmentMetrics by remember { mutableStateOf<List<SegmentMetrics>>(emptyList()) }
     var segmentBacklogsMs by remember { mutableStateOf<List<Long>>(emptyList()) }
+    // Flipped synchronously around the blocking transcribeSegment() call in consumerJob below -
+    // same pattern as uiState flipping around start/stopRecording() for the Record button - so
+    // the UI can show a spinner for exactly the window a segment is being transcribed.
+    var isTranscribing by remember { mutableStateOf(false) }
 
     fun startRecording() {
         recordStartMs = nowMs()
         timeToFirstSegmentMs = null
         segmentMetrics = emptyList()
         segmentBacklogsMs = emptyList()
+        isTranscribing = false
         debugLog("App.startRecording: entered, engine=$selectedEngine")
         when (selectedEngine) {
             AsrEngine.WHISPER -> {
@@ -335,7 +341,9 @@ fun App(
                         val backlogMs = nowMs() - timedSegment.enqueuedAtMs
                         debugLog("App: dequeued segment after ${backlogMs}ms in segmentChannel")
                         segmentBacklogsMs = segmentBacklogsMs + backlogMs
+                        isTranscribing = true
                         val metrics = activePipeline.session.transcribeSegment(timedSegment.samples)
+                        isTranscribing = false
                         segmentMetrics = segmentMetrics + metrics
                         val allSegments = activePipeline.session.segments
                         if (allSegments.size > whisperSegmentsShown) {
@@ -553,11 +561,10 @@ fun App(
                     else -> {
                         val scrollState = rememberScrollState()
                         // Scroll to the bottom whenever a new entry is appended (a segment or a
-                        // recording's metrics line), so the latest text is always visible without
-                        // the user having to scroll manually. Keyed on size (not the transcript
-                        // reference itself) so it only fires when an entry is actually added, not
-                        // on every recomposition.
-                        LaunchedEffect(transcript.size) {
+                        // recording's metrics line) or the processing spinner appears/disappears,
+                        // so the latest text (or the spinner standing in for it) is always visible
+                        // without the user having to scroll manually.
+                        LaunchedEffect(transcript.size, isTranscribing) {
                             scrollState.animateScrollTo(scrollState.maxValue)
                         }
                         Column(
@@ -597,6 +604,14 @@ fun App(
                                         )
                                     }
                                 }
+                            }
+                            // A segment currently being transcribed has nothing to print yet -
+                            // show a spinner after the last printed segment for exactly the
+                            // window isTranscribing is true, same flip-around-the-async-call
+                            // pattern as uiState around start/stopRecording() for the Record
+                            // button, so it disappears the moment the segment's text lands above.
+                            if (isTranscribing) {
+                                CircularProgressIndicator(modifier = Modifier.size(16.dp))
                             }
                         }
                     }
