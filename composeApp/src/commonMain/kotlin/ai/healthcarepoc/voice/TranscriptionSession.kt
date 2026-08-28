@@ -55,3 +55,11 @@ class TranscriptionSession(
 }
 
 internal fun roundTo2(value: Double): Double = kotlin.math.round(value * 100) / 100.0
+
+// Groups digits with '.' every three places (e.g. 12345 -> "12.345") for readability in the
+// on-screen metrics summary - kotlin.text has no cross-platform NumberFormat in commonMain.
+internal fun formatThousands(value: Long): String {
+    val digits = kotlin.math.abs(value).toString()
+    val grouped = digits.reversed().chunked(3).joinToString(".").reversed()
+    return if (value < 0) "-$grouped" else grouped
+}

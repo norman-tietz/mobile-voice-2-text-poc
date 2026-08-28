@@ -1,5 +1,6 @@
 package ai.healthcarepoc.voice
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -12,40 +13,42 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
-import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.CoroutineExceptionHandler
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.DelicateCoroutinesApi
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
+import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.newSingleThreadContext
+import kotlin.collections.List
+import kotlin.collections.average
+import kotlin.collections.emptyList
+import kotlin.collections.forEach
+import kotlin.collections.forEachIndexed
+import kotlin.collections.isNotEmpty
+import kotlin.collections.listOf
+import kotlin.collections.map
+import kotlin.collections.maxOfOrNull
+import kotlin.collections.maxOrNull
+import kotlin.collections.minus
+import kotlin.collections.plus
+import kotlin.sequences.minus
 
 enum class AsrEngine { WHISPER, NATIVE }
 
 sealed interface UiState {
     data object Idle : UiState
+
     // Synchronous gate between a Record tap and startRecording() actually setting Recording -
     // covers the permission-check/request suspension, which can take arbitrarily long (a full
     // system dialog). Without a distinct state here, uiState reads Idle for that whole window,
@@ -87,13 +90,32 @@ private class WhisperPipeline(
 // the pipeline is falling behind live speech (see consumerJob below).
 private class TimedSegment(val samples: FloatArray, val enqueuedAtMs: Long)
 
-// One line of the on-screen transcript history: either a recognized segment (engine marker +
+// One line of the on-screen transcript history: either a recognized segment (engine label +
 // text) or a per-recording metrics summary. Kept as a sealed type instead of a plain String so
-// the two can be styled differently - the marker/summary are visual noise next to the actual
-// recognized text and are greyed out accordingly, see the rendering in App() below.
+// the two can be styled differently - the metrics summary is greyed out as visual noise next to
+// the actual recognized text, which is rendered as quoted, serif italic speech; the engine label
+// is shown once per recording as a chip rather than repeated per segment. See App() below.
 private sealed interface TranscriptEntry {
     data class Segment(val engineLabel: String, val text: String) : TranscriptEntry
-    data class Metrics(val summary: String) : TranscriptEntry
+
+    // Hidden by default - visible is its own MutableState (not a plain Boolean) so toggling it
+    // recomposes without needing to replace the whole transcript list. Tapping any segment text
+    // belonging to this recording flips it; see the rendering in App() below.
+    data class Metrics(
+        val summary: String,
+        val visible: MutableState<Boolean> = mutableStateOf(false)
+    ) : TranscriptEntry
+}
+
+// The Metrics entry belonging to the segment at `fromIndex` - segments for a recording always
+// come before the single Metrics entry appended once it stops, so the first Metrics found at or
+// after this segment's position is the one to toggle.
+private fun List<TranscriptEntry>.metricsEntryFrom(fromIndex: Int): TranscriptEntry.Metrics? {
+    for (i in fromIndex until size) {
+        val entry = this[i]
+        if (entry is TranscriptEntry.Metrics) return entry
+    }
+    return null
 }
 
 @Composable
@@ -305,6 +327,7 @@ fun App(
                 }
                 debugLog("App.startRecording: audioCapture.start() returned, uiState=Recording")
             }
+
             AsrEngine.NATIVE -> {
                 val engine = nativeAsr ?: return
                 uiState = UiState.Recording
@@ -365,6 +388,7 @@ fun App(
                 whisperSegmentsShown = 0
                 debugLog("App.stopRecording: session.stop() returned after ${nowMs() - t2}ms, segments=${finalSegments.size}")
             }
+
             AsrEngine.NATIVE -> {
                 val engine = nativeAsr ?: return
                 nativeStartJob?.join()
@@ -378,14 +402,16 @@ fun App(
         debugLog("App.stopRecording: end-to-end time=${endToEndMs}ms")
         val summary = when (selectedEngine) {
             AsrEngine.WHISPER -> {
-                val firstSegmentText = timeToFirstSegmentMs?.let { "${it}ms" } ?: "n/a"
+                val firstSegmentText = timeToFirstSegmentMs?.let { "${formatThousands(it)}ms" } ?: "n/a"
                 val avgRtf = if (segmentMetrics.isNotEmpty()) roundTo2(segmentMetrics.map { it.rtf }.average()) else 0.0
                 val maxRtf = segmentMetrics.maxOfOrNull { it.rtf } ?: 0.0
                 val maxBacklogMs = segmentBacklogsMs.maxOrNull() ?: 0L
-                "End-to-end: ${endToEndMs}ms | First segment: $firstSegmentText | " +
-                    "Segments: ${segmentMetrics.size} (avg RTF $avgRtf, max $maxRtf) | Max backlog: ${maxBacklogMs}ms"
+                "End-to-end: ${formatThousands(endToEndMs)}ms | First segment: $firstSegmentText | " +
+                        "Segments: ${formatThousands(segmentMetrics.size.toLong())} (avg RTF $avgRtf, max $maxRtf) | " +
+                        "Max backlog: ${formatThousands(maxBacklogMs)}ms"
             }
-            AsrEngine.NATIVE -> "End-to-end: ${endToEndMs}ms"
+
+            AsrEngine.NATIVE -> "End-to-end: ${formatThousands(endToEndMs)}ms"
         }
         // Appended to the transcript history (not a separate transient field) so it survives
         // into the next recording instead of disappearing the moment Record is tapped again.
@@ -435,6 +461,7 @@ fun App(
                     debugLog("App: stopRecording() coroutine completed")
                 }
             }
+
             UiState.Idle -> {
                 // Mirrors the Stop branch's synchronous gate above: flip uiState before
                 // launching so a second rapid tap - arriving anywhere in the permission
@@ -458,6 +485,7 @@ fun App(
                     }
                 }
             }
+
             UiState.Starting, UiState.Stopping, UiState.PermissionDenied, is UiState.Error -> Unit
         }
     }
@@ -477,26 +505,57 @@ fun App(
                             }
                         }
                     }
+
                     is UiState.Error -> {
                         Text("Error: ${state.message}")
                     }
+
                     else -> {
                         Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-                            transcript.forEach { entry ->
+                            transcript.forEachIndexed { index, entry ->
                                 when (entry) {
-                                    is TranscriptEntry.Segment -> Text(
-                                        buildAnnotatedString {
-                                            withStyle(SpanStyle(color = Color.Gray)) {
-                                                append("[${entry.engineLabel}] ")
-                                            }
-                                            append(entry.text)
+                                    is TranscriptEntry.Segment -> {
+                                        // A recording's segments are exactly the run of Segment
+                                        // entries since the last Metrics entry (appended once, at
+                                        // the end of each recording) - so the tag only needs to
+                                        // show on the first Segment of that run, not every one.
+                                        val isFirstOfRecording =
+                                            index == 0 || transcript[index - 1] is TranscriptEntry.Metrics
+                                        if (isFirstOfRecording) {
+                                            AssistChip(
+                                                onClick = {},
+                                                label = { Text(entry.engineLabel) }
+                                            )
                                         }
-                                    )
-                                    is TranscriptEntry.Metrics -> Text(
-                                        entry.summary,
-                                        color = Color.Gray,
-                                        fontSize = 12.sp
-                                    )
+                                        val topSpacing = if (isFirstOfRecording && index != 0) 12.dp else 0.dp
+                                        val sessionMetrics = transcript.metricsEntryFrom(index)
+                                        Text(
+                                            "„${entry.text}“",
+                                            fontFamily = FontFamily.Serif,
+                                            fontStyle = FontStyle.Italic,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(top = if (isFirstOfRecording) 0.dp else 12.dp)
+                                                .let { base ->
+                                                    sessionMetrics?.let { metrics ->
+                                                        base.clickable {
+                                                            metrics.visible.value = !metrics.visible.value
+                                                        }
+                                                    } ?: base
+                                                }
+                                        )
+                                    }
+
+                                    is TranscriptEntry.Metrics -> {
+                                        // Hidden by default - only shown while its recording's
+                                        // segment text has been tapped to reveal it.
+                                        if (entry.visible.value) {
+                                            Text(
+                                                entry.summary,
+                                                color = Color.Gray,
+                                                fontSize = 12.sp
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -514,7 +573,11 @@ fun App(
                         EngineToggleButton("Whisper", selectedEngine == AsrEngine.WHISPER, toggleEnabled) {
                             selectedEngine = AsrEngine.WHISPER
                         }
-                        EngineToggleButton("Native", selectedEngine == AsrEngine.NATIVE, toggleEnabled && nativeAvailable) {
+                        EngineToggleButton(
+                            "Native",
+                            selectedEngine == AsrEngine.NATIVE,
+                            toggleEnabled && nativeAvailable
+                        ) {
                             selectedEngine = AsrEngine.NATIVE
                         }
                     }

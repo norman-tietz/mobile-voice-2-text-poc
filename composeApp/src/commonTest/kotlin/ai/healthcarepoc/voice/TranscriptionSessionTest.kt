@@ -75,3 +75,24 @@ class TranscriptionSessionTest {
         assertEquals(emptyList(), session.segments)
     }
 }
+
+class FormatThousandsTest {
+    @Test
+    fun `leaves numbers under 1000 unchanged`() {
+        assertEquals("0", formatThousands(0))
+        assertEquals("42", formatThousands(42))
+        assertEquals("999", formatThousands(999))
+    }
+
+    @Test
+    fun `groups digits with a dot every three places`() {
+        assertEquals("1.000", formatThousands(1000))
+        assertEquals("12.345", formatThousands(12345))
+        assertEquals("123.456.789", formatThousands(123456789))
+    }
+
+    @Test
+    fun `keeps the minus sign in front of the grouped digits`() {
+        assertEquals("-12.345", formatThousands(-12345))
+    }
+}
