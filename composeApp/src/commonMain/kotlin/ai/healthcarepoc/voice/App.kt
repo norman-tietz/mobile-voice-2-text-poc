@@ -21,7 +21,14 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
-import androidx.compose.runtime.*
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -30,21 +37,16 @@ import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
-import kotlin.collections.List
-import kotlin.collections.average
-import kotlin.collections.emptyList
-import kotlin.collections.forEach
-import kotlin.collections.forEachIndexed
-import kotlin.collections.isNotEmpty
-import kotlin.collections.listOf
-import kotlin.collections.map
-import kotlin.collections.maxOfOrNull
-import kotlin.collections.maxOrNull
-import kotlin.collections.minus
-import kotlin.collections.plus
-import kotlin.sequences.minus
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.newSingleThreadContext
 
 enum class AsrEngine { WHISPER, NATIVE }
 
@@ -104,7 +106,7 @@ private class TimedSegment(val samples: FloatArray, val enqueuedAtMs: Long)
 
 // One line of the on-screen transcript history: either a recognized segment (engine label +
 // text) or a per-recording metrics summary. Kept as a sealed type instead of a plain String so
-// the two can be styled differently - the metrics summary is greyed out as visual noise next to
+// the two can be styled differently - the metrics summary is hidden-by-default/tap-to-reveal next to
 // the actual recognized text, which is rendered as quoted, serif italic speech; the engine label
 // is shown once per recording as a chip rather than repeated per segment. See App() below.
 private sealed interface TranscriptEntry {
@@ -584,7 +586,7 @@ fun App(
                                 ) {
                                     recording.engineLabel?.let { label ->
                                         AssistChip(
-                                            onClick = {},
+                                            onClick = { recording.metrics?.let { metrics -> metrics.visible.value = !metrics.visible.value } },
                                             label = { Text(label) }
                                         )
                                     }
