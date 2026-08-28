@@ -195,11 +195,19 @@ fun App(
     val nativeAvailable = remember(nativeAsr) { nativeAsr?.isAvailable() ?: false }
     KeepScreenOn(enabled = uiState == UiState.Recording)
 
+    // Resident memory (RSS) this process was using just before the Whisper model + VAD were
+    // loaded, vs. just after - see currentResidentMemoryMb() for what this measures and why. A
+    // single session-wide number rather than something recomputed per recording, since loading
+    // is a one-time cost: the model's own footprint doesn't grow or shrink from one recording to
+    // the next.
+    var modelMemoryMb by remember { mutableStateOf<Long?>(null) }
+
     // Loading either model can fail (missing/corrupt bundled file); pipeline stays null
     // and an error state is shown instead of letting the app crash on first use.
     val pipeline = remember {
         runCatching {
             val loadStartMs = nowMs()
+            val memoryBeforeLoadMb = currentResidentMemoryMb()
             val engine = WhisperEngine(modelPathProvider.resolveModelPath())
             // If WhisperVad's init throws, engine is already holding a native context - release
             // it here rather than letting it leak, since pipeline (and the DisposableEffect that
@@ -210,7 +218,14 @@ fun App(
                 engine.release()
                 throw e
             }
-            debugLog("App: Whisper model + VAD load time=${nowMs() - loadStartMs}ms")
+            val memoryAfterLoadMb = currentResidentMemoryMb()
+            if (memoryBeforeLoadMb != null && memoryAfterLoadMb != null) {
+                modelMemoryMb = memoryAfterLoadMb - memoryBeforeLoadMb
+            }
+            debugLog(
+                "App: Whisper model + VAD load time=${nowMs() - loadStartMs}ms, " +
+                    "resident memory ${memoryBeforeLoadMb}MB -> ${memoryAfterLoadMb}MB"
+            )
             WhisperPipeline(
                 TranscriptionSession(engine, sampleRateHz = 16_000),
                 SpeechSegmenter(vad, sampleRateHz = 16_000),
@@ -272,9 +287,15 @@ fun App(
     var timeToFirstSegmentMs by remember { mutableStateOf<Long?>(null) }
     var segmentMetrics by remember { mutableStateOf<List<SegmentMetrics>>(emptyList()) }
     var segmentBacklogsMs by remember { mutableStateOf<List<Long>>(emptyList()) }
+    // Resident memory at the Record tap, so stopRecording() can report how much this one
+    // recording added on top - the audio/segment channels, VAD/segmenter buffers, and this
+    // recording's own transcript text, as opposed to modelMemoryMb above (paid once, at load,
+    // regardless of how many recordings follow).
+    var recordStartMemoryMb by remember { mutableStateOf<Long?>(null) }
 
     fun startRecording() {
         recordStartMs = nowMs()
+        recordStartMemoryMb = currentResidentMemoryMb()
         timeToFirstSegmentMs = null
         segmentMetrics = emptyList()
         segmentBacklogsMs = emptyList()
@@ -440,6 +461,14 @@ fun App(
         }
         val endToEndMs = nowMs() - recordStartMs
         debugLog("App.stopRecording: end-to-end time=${endToEndMs}ms")
+        // Delta rather than an absolute figure - isolates what THIS recording added (audio/segment
+        // channel buffers, VAD/segmenter state, this recording's own transcript text) from the
+        // model's fixed baseline (modelMemoryMb) and whatever else the process happens to be
+        // holding. Applies to both engines - it's a general OS-level reading, not Whisper-specific.
+        val recordingMemoryMb = currentResidentMemoryMb()?.let { afterMb ->
+            recordStartMemoryMb?.let { beforeMb -> afterMb - beforeMb }
+        }
+        val memoryText = recordingMemoryMb?.let { "${formatThousands(it)}MB" } ?: "n/a"
         val summary = when (selectedEngine) {
             AsrEngine.WHISPER -> {
                 val firstSegmentText = timeToFirstSegmentMs?.let { "${formatThousands(it)}ms" } ?: "n/a"
@@ -448,10 +477,10 @@ fun App(
                 val maxBacklogMs = segmentBacklogsMs.maxOrNull() ?: 0L
                 "End-to-end: ${formatThousands(endToEndMs)}ms | First segment: $firstSegmentText | " +
                         "Segments: ${formatThousands(segmentMetrics.size.toLong())} (avg RTF $avgRtf, max $maxRtf) | " +
-                        "Max backlog: ${formatThousands(maxBacklogMs)}ms"
+                        "Max backlog: ${formatThousands(maxBacklogMs)}ms | Memory: $memoryText"
             }
 
-            AsrEngine.NATIVE -> "End-to-end: ${formatThousands(endToEndMs)}ms"
+            AsrEngine.NATIVE -> "End-to-end: ${formatThousands(endToEndMs)}ms | Memory: $memoryText"
         }
         // Appended to the transcript history (not a separate transient field) so it survives
         // into the next recording instead of disappearing the moment Record is tapped again.
@@ -592,6 +621,18 @@ fun App(
                         }
                     }
                 }
+            }
+
+            // Session-wide, not per-recording (unlike the "Memory" figure folded into each
+            // recording's own metrics summary above) - shown unconditionally rather than
+            // tap-to-reveal, since it's a one-time fact about this run of the app rather than
+            // something tied to any one recording in the transcript.
+            modelMemoryMb?.let { mb ->
+                Text(
+                    "Model in memory: ~${formatThousands(mb)}MB",
+                    color = Color.Gray,
+                    fontSize = 12.sp
+                )
             }
 
             if (uiState !is UiState.PermissionDenied && uiState !is UiState.Error) {
