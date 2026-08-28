@@ -125,8 +125,10 @@ need on-device verification, not just green tests.
 throughout the pipeline for timing and state tracing. Separately, `App.kt` appends a
 per-recording metrics summary (end-to-end time, time-to-first-segment, per-segment
 real-time-factor, segment-channel backlog) directly into the on-screen transcript as a
-greyed-out `TranscriptEntry.Metrics` entry, since Logcat isn't always reachable while
-testing on a device — this is intentionally visible in the UI, not just diagnostic noise.
+`TranscriptEntry.Metrics` entry, since Logcat isn't always reachable while testing on a
+device — this is intentionally reachable from the UI, not just diagnostic noise, though
+it's hidden by default and only revealed by tapping the recording it belongs to (see
+`groupByRecording()`'s per-recording `clickable` in `App.kt`).
 
 ### Engine comparison toggle (Android only)
 

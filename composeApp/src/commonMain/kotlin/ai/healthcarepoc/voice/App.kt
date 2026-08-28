@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
@@ -45,6 +46,16 @@ import kotlin.collections.plus
 import kotlin.sequences.minus
 
 enum class AsrEngine { WHISPER, NATIVE }
+
+// Single source of truth for the on-screen engine label - shared by TranscriptEntry.Segment (one
+// per recognized segment) and TranscriptEntry.Metrics (one per recording, including recordings
+// with zero segments), so a recording's chip always has a label to show regardless of which of
+// the two supplied it.
+private val AsrEngine.label: String
+    get() = when (this) {
+        AsrEngine.WHISPER -> "Whisper"
+        AsrEngine.NATIVE -> "Native"
+    }
 
 sealed interface UiState {
     data object Idle : UiState
@@ -99,23 +110,52 @@ private sealed interface TranscriptEntry {
     data class Segment(val engineLabel: String, val text: String) : TranscriptEntry
 
     // Hidden by default - visible is its own MutableState (not a plain Boolean) so toggling it
-    // recomposes without needing to replace the whole transcript list. Tapping any segment text
-    // belonging to this recording flips it; see the rendering in App() below.
+    // recomposes without needing to replace the whole transcript list. Tapping anywhere in this
+    // recording's block (chip, segment text, or the whitespace around them - see RecordingGroup
+    // below) flips it; see the rendering in App() below. Carries its own engineLabel (not just
+    // read off a Segment) so a recording with zero segments can still show its chip.
     data class Metrics(
         val summary: String,
+        val engineLabel: String,
         val visible: MutableState<Boolean> = mutableStateOf(false)
     ) : TranscriptEntry
 }
 
-// The Metrics entry belonging to the segment at `fromIndex` - segments for a recording always
-// come before the single Metrics entry appended once it stops, so the first Metrics found at or
-// after this segment's position is the one to toggle.
-private fun List<TranscriptEntry>.metricsEntryFrom(fromIndex: Int): TranscriptEntry.Metrics? {
-    for (i in fromIndex until size) {
-        val entry = this[i]
-        if (entry is TranscriptEntry.Metrics) return entry
+// One recording's worth of transcript entries: the segments produced while it was recording,
+// plus the Metrics entry appended once it stopped (null only for a recording still in progress -
+// segments streaming in with no Metrics yet). Grouping at render time, rather than inferring
+// recording boundaries per-entry from list adjacency, means the whole group - chip, every
+// segment, and the metrics line - can share a single clickable region instead of wiring the same
+// toggle into three separate leaf components; see the rendering in App() below.
+private class RecordingGroup(val segments: List<TranscriptEntry.Segment>, val metrics: TranscriptEntry.Metrics?) {
+    // Segment.engineLabel and Metrics.engineLabel are always the same value for one recording -
+    // both come from AsrEngine.label at the time it ran (see its call sites in startRecording()/
+    // stopRecording()). Reading from whichever is present means the chip renders off a single
+    // property regardless of segment count, instead of the call site having to know which of the
+    // two to check.
+    val engineLabel: String? get() = segments.firstOrNull()?.engineLabel ?: metrics?.engineLabel
+}
+
+// Splits the flat transcript into per-recording groups: each Metrics entry closes out the run of
+// Segment entries that came before it (segments for a recording always precede the single
+// Metrics entry appended once it stops), and any trailing Segments with no Metrics yet form the
+// currently-in-progress recording's group.
+private fun List<TranscriptEntry>.groupByRecording(): List<RecordingGroup> {
+    val groups = mutableListOf<RecordingGroup>()
+    var pending = mutableListOf<TranscriptEntry.Segment>()
+    for (entry in this) {
+        when (entry) {
+            is TranscriptEntry.Segment -> pending.add(entry)
+            is TranscriptEntry.Metrics -> {
+                groups.add(RecordingGroup(pending, entry))
+                pending = mutableListOf()
+            }
+        }
     }
-    return null
+    if (pending.isNotEmpty()) {
+        groups.add(RecordingGroup(pending, null))
+    }
+    return groups
 }
 
 @Composable
@@ -305,7 +345,7 @@ fun App(
                                 firstSegmentLogged = true
                             }
                             transcript = transcript + allSegments.subList(whisperSegmentsShown, allSegments.size)
-                                .map { TranscriptEntry.Segment("Whisper", it) }
+                                .map { TranscriptEntry.Segment(selectedEngine.label, it) }
                             whisperSegmentsShown = allSegments.size
                         }
                     }
@@ -334,7 +374,7 @@ fun App(
                 nativeStartJob = scope.launch {
                     runCatching {
                         engine.start(
-                            onSegment = { text -> transcript = transcript + TranscriptEntry.Segment("Native", text) },
+                            onSegment = { text -> transcript = transcript + TranscriptEntry.Segment(selectedEngine.label, text) },
                             onError = { message -> uiState = UiState.Error(message) }
                         )
                     }.onFailure { e ->
@@ -374,7 +414,7 @@ fun App(
                 val finalSegments = activePipeline.session.segments
                 if (finalSegments.size > whisperSegmentsShown) {
                     transcript = transcript + finalSegments.subList(whisperSegmentsShown, finalSegments.size)
-                        .map { TranscriptEntry.Segment("Whisper", it) }
+                        .map { TranscriptEntry.Segment(selectedEngine.label, it) }
                 }
                 activePipeline.session.stop()
                 // pipeline is reused (remember{}'d) across multiple Record/Stop cycles in the
@@ -415,7 +455,7 @@ fun App(
         }
         // Appended to the transcript history (not a separate transient field) so it survives
         // into the next recording instead of disappearing the moment Record is tapped again.
-        transcript = transcript + TranscriptEntry.Metrics(summary)
+        transcript = transcript + TranscriptEntry.Metrics(summary, selectedEngine.label)
         uiState = UiState.Idle
         debugLog("App.stopRecording: uiState=Idle")
     }
@@ -511,50 +551,41 @@ fun App(
                     }
 
                     else -> {
-                        Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-                            transcript.forEachIndexed { index, entry ->
-                                when (entry) {
-                                    is TranscriptEntry.Segment -> {
-                                        // A recording's segments are exactly the run of Segment
-                                        // entries since the last Metrics entry (appended once, at
-                                        // the end of each recording) - so the tag only needs to
-                                        // show on the first Segment of that run, not every one.
-                                        val isFirstOfRecording =
-                                            index == 0 || transcript[index - 1] is TranscriptEntry.Metrics
-                                        if (isFirstOfRecording) {
-                                            AssistChip(
-                                                onClick = {},
-                                                label = { Text(entry.engineLabel) }
-                                            )
+                        Column(
+                            modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            transcript.groupByRecording().forEach { recording ->
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(min = 24.dp)
+                                        .let { base ->
+                                            recording.metrics?.let { metrics ->
+                                                base.clickable { metrics.visible.value = !metrics.visible.value }
+                                            } ?: base
                                         }
-                                        val topSpacing = if (isFirstOfRecording && index != 0) 12.dp else 0.dp
-                                        val sessionMetrics = transcript.metricsEntryFrom(index)
-                                        Text(
-                                            "„${entry.text}“",
-                                            fontFamily = FontFamily.Serif,
-                                            fontStyle = FontStyle.Italic,
-                                            fontWeight = FontWeight.Bold,
-                                            modifier = Modifier.padding(top = if (isFirstOfRecording) 0.dp else 12.dp)
-                                                .let { base ->
-                                                    sessionMetrics?.let { metrics ->
-                                                        base.clickable {
-                                                            metrics.visible.value = !metrics.visible.value
-                                                        }
-                                                    } ?: base
-                                                }
+                                ) {
+                                    recording.engineLabel?.let { label ->
+                                        AssistChip(
+                                            onClick = {},
+                                            label = { Text(label) }
                                         )
                                     }
-
-                                    is TranscriptEntry.Metrics -> {
-                                        // Hidden by default - only shown while its recording's
-                                        // segment text has been tapped to reveal it.
-                                        if (entry.visible.value) {
-                                            Text(
-                                                entry.summary,
-                                                color = Color.Gray,
-                                                fontSize = 12.sp
-                                            )
-                                        }
+                                    recording.segments.forEach { segment ->
+                                        Text(
+                                            "„${segment.text}“",
+                                            fontFamily = FontFamily.Serif,
+                                            fontStyle = FontStyle.Italic,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                    if (recording.metrics?.visible?.value == true) {
+                                        Text(
+                                            recording.metrics.summary,
+                                            color = Color.Gray,
+                                            fontSize = 12.sp
+                                        )
                                     }
                                 }
                             }
