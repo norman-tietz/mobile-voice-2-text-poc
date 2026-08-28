@@ -580,8 +580,17 @@ fun App(
                     }
 
                     else -> {
+                        val scrollState = rememberScrollState()
+                        // Scroll to the bottom whenever a new entry is appended (a segment or a
+                        // recording's metrics line), so the latest text is always visible without
+                        // the user having to scroll manually. Keyed on size (not the transcript
+                        // reference itself) so it only fires when an entry is actually added, not
+                        // on every recomposition.
+                        LaunchedEffect(transcript.size) {
+                            scrollState.animateScrollTo(scrollState.maxValue)
+                        }
                         Column(
-                            modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
+                            modifier = Modifier.fillMaxSize().verticalScroll(scrollState),
                             verticalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
                             transcript.groupByRecording().forEach { recording ->
