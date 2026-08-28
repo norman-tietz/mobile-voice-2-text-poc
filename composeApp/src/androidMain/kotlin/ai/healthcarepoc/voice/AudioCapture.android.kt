@@ -4,12 +4,14 @@ import android.annotation.SuppressLint
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.NoiseSuppressor
 import kotlin.concurrent.thread
 
 actual class AudioCapture {
     actual val sampleRateHz = 16_000
     private var record: AudioRecord? = null
     private var recordingThread: Thread? = null
+    private var noiseSuppressor: NoiseSuppressor? = null
     @Volatile private var isRecording = false
 
     @SuppressLint("MissingPermission")
@@ -31,6 +33,18 @@ actual class AudioCapture {
         record = audioRecord
         isRecording = true
         debugLog("AudioCapture.start: bufferSize=$bufferSize minBufferSize=$minBufferSize audioRecordState=${audioRecord.state}")
+        // VOICE_RECOGNITION deliberately keeps the HAL close to raw (minimal/no AGC/NS/AEC,
+        // unlike e.g. VOICE_COMMUNICATION), so noise suppression isn't happening anywhere else
+        // in this pipeline - attach it explicitly. Hardware/vendor-dependent (isAvailable() can
+        // be true with create() still returning null on some devices per its own docs), so this
+        // is a best-effort improvement, not a guarantee - falls back to unsuppressed audio if
+        // unsupported rather than failing the recording.
+        noiseSuppressor = if (NoiseSuppressor.isAvailable()) {
+            NoiseSuppressor.create(audioRecord.audioSessionId)?.apply { enabled = true }
+        } else {
+            null
+        }
+        debugLog("AudioCapture.start: NoiseSuppressor ${if (noiseSuppressor != null) "enabled" else "unavailable on this device"}")
         audioRecord.startRecording()
         debugLog("AudioCapture.start: startRecording() called, recordingState=${audioRecord.recordingState}")
 
@@ -65,6 +79,8 @@ actual class AudioCapture {
         record?.stop()
         record?.release()
         record = null
+        noiseSuppressor?.release()
+        noiseSuppressor = null
         debugLog("AudioCapture.stop: done")
     }
 }

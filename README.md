@@ -28,29 +28,44 @@ reverted in favor of whisper.cpp.
 ## How it works
 
 ```
-AudioCapture (mic) → resampleTo16k → SpeechSegmenter (WhisperVad) → TranscriptionSession
-                                                                            ↓
-                                                                  WhisperEngine (whisper.cpp)
-                                                                            ↓
-                                                                  Compose UI (transcript segments)
+AudioCapture (mic) → resampleTo16k → audioChannel
+                                          ↓
+                     SpeechSegmenter (WhisperVad) — real-time, never calls transcribe()
+                                          ↓
+                                    segmentChannel
+                                          ↓
+            TranscriptionSession → WhisperEngine (whisper.cpp) — own dispatcher thread
+                                          ↓
+                              Compose UI (transcript segments)
 ```
 
 - **`AudioCapture`** (`expect`/`actual`) — captures microphone audio.
-  Android via `AudioRecord`, iOS via `AVAudioEngine`.
+  Android via `AudioRecord` (with `NoiseSuppressor` attached where the
+  device supports it), iOS via `AVAudioEngine`.
 - **`SpeechSegmenter`** — VAD-probability-driven trailing-silence detection;
   feeds each audio chunk to `WhisperVad` (a thin wrapper over whisper.cpp's
   Silero VAD, `expect`/`actual`) for a per-chunk speech probability, and
   applies hysteresis bookkeeping (entering speech requires crossing a high
   threshold, leaving it requires ~500ms of trailing audio below a lower
-  threshold) to decide segment boundaries in real time.
-- **`TranscriptionSession`** — receives already-finalized segments from
-  `SpeechSegmenter` and triggers transcription of each one, or of whatever
+  threshold) to decide segment boundaries in real time, plus a 30s hard cap
+  on a single segment regardless of hysteresis, for sustained ambient noise
+  that never resolves clearly to silence.
+- Capture and segmentation are decoupled from transcription by two
+  unlimited `Channel`s (`audioChannel`, `segmentChannel`) and run as
+  separate coroutines — `SpeechSegmenter` only ever does real-time VAD
+  bookkeeping, so it can't fall behind no matter how long a
+  `transcribe()` call takes. The transcribe stage runs on its own
+  dedicated single-thread dispatcher rather than the shared coroutine
+  pool, so a long native decode can't starve the segmenter out of CPU
+  time either.
+- **`TranscriptionSession`** — receives already-finalized segments off
+  `segmentChannel` and triggers transcription of each one, or of whatever
   is still pending when recording stops.
 - **`WhisperEngine`** (`expect`/`actual`) — runs whisper.cpp natively.
   Android via a JNI/CMake binding, iOS via Kotlin/Native cinterop. Both
   bind the same vendored `whisper.cpp` C library and the same bundled
-  German multilingual `ggml-small` model, with `language` hardcoded to
-  `"de"`.
+  German multilingual `ggml-small` model (q8_0-quantized), with beam
+  search (`beam_size = 8`) and `language` hardcoded to `"de"`.
 - **`App.kt`** — the shared Compose Multiplatform UI wiring all of the
   above together, plus mic-permission handling and stop-on-background
   behavior.
@@ -67,8 +82,9 @@ Whisper pipeline above and Android's on-device `SpeechRecognizer`
 so it never falls back to cloud-based recognition. This exists purely to
 let the two engines' output be compared by ear on the same device — see
 `docs/superpowers/specs/2026-08-24-native-asr-comparison-design.md`. Each
-transcript line is prefixed with the engine that produced it
-(`[Whisper]`/`[Native]`). The toggle doesn't appear on iOS.
+recording in the transcript is tagged with the engine that produced it
+(a "Whisper"/"Native" chip shown once at the start of the recording,
+not repeated per segment). The toggle doesn't appear on iOS.
 
 ## Tech stack
 
