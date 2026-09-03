@@ -25,6 +25,22 @@ git submodule update --init   # if not cloned with --recurse-submodules
 submodule and needs `cmake` on `PATH` (or `CMAKE=/path/to/cmake` if it's only bundled
 with the Android SDK, e.g. `$ANDROID_HOME/cmake/<version>/bin/cmake`).
 
+The "Clinical" engine toggle needs a third asset, `ggml-small-clinical-de.bin`, that
+`download-model.sh` does *not* produce. It's a clinical-context fine-tune of `ggml-small`
+converted from a Hugging Face safetensors checkpoint built by the separate
+`medical-data-sources` project. It's optional — the app builds and runs without it, only
+the Clinical toggle fails when selected. To enable it:
+
+```bash
+cp -r <medical-data-sources>/data/finetune/whisper-small-clinical-de models-src/   # gitignored
+./scripts/build-clinical-model.sh   # convert-h5-to-ggml.py -> ggml -> q8_0, same as download-model.sh
+```
+
+`build-clinical-model.sh` needs `python3` with `torch` + `transformers` (matching the
+checkpoint's `config.json` `transformers_version`) for the ggml conversion, and the same
+`cmake` + toolchain as `download-model.sh` for the q8_0 step — without the latter it ships
+the unquantized fp16 model (~465 MiB) and prints a warning.
+
 For iOS, whisper.cpp's static libs also aren't built by Gradle — build them once (and
 again whenever the `third_party/whisper.cpp` submodule commit changes):
 
@@ -130,14 +146,33 @@ device — this is intentionally reachable from the UI, not just diagnostic nois
 it's hidden by default and only revealed by tapping the recording it belongs to (see
 `groupByRecording()`'s per-recording `clickable` in `App.kt`).
 
-### Engine comparison toggle (Android only)
+### Engine comparison toggle
 
-`AsrEngine.WHISPER` vs `AsrEngine.NATIVE` in `App.kt` lets the Whisper pipeline above be
-A/B'd by ear against Android's on-device `SpeechRecognizer`
-(`AndroidSpeechRecognizerEngine`), gated on `isOnDeviceRecognitionAvailable` (API 31+).
-This exists purely for comparison — see
-`docs/superpowers/specs/2026-08-24-native-asr-comparison-design.md` — and the toggle
-doesn't exist on iOS (`nativeAsr` is a nullable parameter to `App()`, always null there).
+`AsrEngine` in `App.kt` has three values, A/B'd by ear via a toggle next to the Record
+button:
+
+- `WHISPER` and `WHISPER_CLINICAL` run the **exact same** pipeline (`startRecording()`/
+  `stopRecording()`/metrics all use `AsrEngine.WHISPER, AsrEngine.WHISPER_CLINICAL ->`
+  as one branch). They differ only in which file `WhisperEngine` loads — stock
+  `ggml-small.bin` vs the fine-tune `ggml-small-clinical-de.bin`
+  (`ModelPathProvider.resolveModelPath()` vs `resolveClinicalModelPath()`). Decoding
+  params in `whisper_jni.cpp` / `WhisperEngine.ios.kt` are unchanged and apply to both.
+- `NATIVE` (Android only) is Android's on-device `SpeechRecognizer`
+  (`AndroidSpeechRecognizerEngine`), gated on `isOnDeviceRecognitionAvailable` (API 31+).
+  See `docs/superpowers/specs/2026-08-24-native-asr-comparison-design.md`.
+
+Only **one** Whisper model is resident at a time. `App.kt` tracks `useClinicalModel`
+(set only by the Whisper/Clinical toggle handlers — switching to/from `NATIVE` leaves it
+alone, so the model stays loaded) and a `LaunchedEffect(useClinicalModel)` rebuilds the
+`pipeline` on `transcribeDispatcher` whenever it flips: release the old engine/VAD, null
+`pipeline` (UI shows "Loading model…", toggles + Record disabled), load the new one
+(~1–3 s). The toggle is `uiState == Idle && pipeline != null`-gated, so a model swap can
+never race an in-flight recording or a still-loading model. `scope` + `transcribeDispatcher`
+teardown moved to a `DisposableEffect(Unit)` (they outlive any single model); the
+`LaunchedEffect` owns releasing the outgoing model on a swap.
+
+The toggle row renders on iOS too (Whisper/Clinical only — `nativeAsr` is a nullable
+`App()` parameter, always null there).
 
 ## Design docs
 

@@ -63,5 +63,8 @@ DerivedData/
 composeApp/src/androidMain/assets/models/*.bin
 iosApp/iosApp/Resources/*.bin
 
+### Fine-tuned clinical checkpoint (copied in by hand, converted by scripts/build-clinical-model.sh) ###
+/models-src/
+
 ### AI configuration
 /.claude/

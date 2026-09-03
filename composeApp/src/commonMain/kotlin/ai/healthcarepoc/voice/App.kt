@@ -35,6 +35,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -47,8 +48,12 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.newSingleThreadContext
+import kotlinx.coroutines.withContext
 
-enum class AsrEngine { WHISPER, NATIVE }
+// WHISPER (stock ggml-small) and WHISPER_CLINICAL (a clinical-context fine-tune) run the exact
+// same pipeline below and differ only in which model file WhisperEngine loads - see the
+// whisper-variant LaunchedEffect in App(). NATIVE is the platform recognizer, a separate path.
+enum class AsrEngine { WHISPER, WHISPER_CLINICAL, NATIVE }
 
 // Single source of truth for the on-screen engine label - shared by TranscriptEntry.Segment (one
 // per recognized segment) and TranscriptEntry.Metrics (one per recording, including recordings
@@ -57,6 +62,7 @@ enum class AsrEngine { WHISPER, NATIVE }
 private val AsrEngine.label: String
     get() = when (this) {
         AsrEngine.WHISPER -> "Whisper"
+        AsrEngine.WHISPER_CLINICAL -> "Clinical"
         AsrEngine.NATIVE -> "Native"
     }
 
@@ -194,38 +200,73 @@ fun App(
     // to actually finish instead of cancelling it out from under itself - see its onDispose.
     var stopRecordingJob by remember { mutableStateOf<Job?>(null) }
     var selectedEngine by remember { mutableStateOf(AsrEngine.WHISPER) }
+    // Which Whisper model file the pipeline currently holds. Tracked separately from
+    // selectedEngine so switching to/from NATIVE never reloads the model - only a
+    // Whisper<->Clinical switch does. Kept in step with selectedEngine by the engine toggle
+    // handlers (the only writers).
+    var useClinicalModel by remember { mutableStateOf(false) }
     var whisperSegmentsShown by remember { mutableStateOf(0) }
     val nativeAvailable = remember(nativeAsr) { nativeAsr?.isAvailable() ?: false }
     KeepScreenOn(enabled = uiState == UiState.Recording)
 
-    // Loading either model can fail (missing/corrupt bundled file); pipeline stays null
-    // and an error state is shown instead of letting the app crash on first use.
-    val pipeline = remember {
-        runCatching {
-            val loadStartMs = nowMs()
-            val engine = WhisperEngine(modelPathProvider.resolveModelPath())
-            // If WhisperVad's init throws, engine is already holding a native context - release
-            // it here rather than letting it leak, since pipeline (and the DisposableEffect that
-            // would otherwise release it) never gets constructed in that case.
-            val vad = try {
-                WhisperVad(modelPathProvider.resolveVadModelPath())
-            } catch (e: Throwable) {
-                engine.release()
-                throw e
+    // The Whisper pipeline (native WhisperEngine + WhisperVad contexts). Null while a model is
+    // loading: on first composition, and for the ~1-3s after each Whisper<->Clinical toggle,
+    // since the pipeline is rebuilt whenever the selected model file changes. The UI shows
+    // "Loading model…" and disables the engine toggles + Record button for that window.
+    var pipeline by remember { mutableStateOf<WhisperPipeline?>(null) }
+
+    // Builds the pipeline, and rebuilds it on a Whisper<->Clinical switch. Off the main thread
+    // (transcribeDispatcher): WhisperEngine()'s model load is a blocking native call of a
+    // second or more, and running it in the composition would freeze the UI. Reusing
+    // transcribeDispatcher is safe - a load only runs while Idle (first composition, or an
+    // Idle-gated toggle), never while consumerJob is transcribing on that thread. Loading
+    // either model file can fail (missing/corrupt asset); that surfaces as an error state
+    // instead of a crash. The engine toggles are disabled until the load lands, so
+    // useClinicalModel can't change again mid-load and strand the half-built pipeline.
+    LaunchedEffect(useClinicalModel) {
+        // Release the outgoing model before loading the next. Safe to do inline (a model swap
+        // only happens while Idle, so no transcribe() can be touching this context) and cheap
+        // (native free, not the multi-second load).
+        pipeline?.release()
+        pipeline = null
+        val built = withContext(transcribeDispatcher) {
+            runCatching {
+                val loadStartMs = nowMs()
+                val modelPath = if (useClinicalModel) {
+                    modelPathProvider.resolveClinicalModelPath()
+                } else {
+                    modelPathProvider.resolveModelPath()
+                }
+                val engine = WhisperEngine(modelPath)
+                // If WhisperVad's init throws, engine is already holding a native context -
+                // release it here rather than leak it, since the WhisperPipeline (and the
+                // DisposableEffect that would otherwise release it) never gets constructed.
+                val vad = try {
+                    WhisperVad(modelPathProvider.resolveVadModelPath())
+                } catch (e: Throwable) {
+                    engine.release()
+                    throw e
+                }
+                debugLog("App: Whisper model (clinical=$useClinicalModel) + VAD load time=${nowMs() - loadStartMs}ms")
+                WhisperPipeline(
+                    TranscriptionSession(engine, sampleRateHz = 16_000),
+                    SpeechSegmenter(vad, sampleRateHz = 16_000),
+                    engine,
+                    vad
+                )
             }
-            debugLog("App: Whisper model + VAD load time=${nowMs() - loadStartMs}ms")
-            WhisperPipeline(
-                TranscriptionSession(engine, sampleRateHz = 16_000),
-                SpeechSegmenter(vad, sampleRateHz = 16_000),
-                engine,
-                vad
-            )
-        }.onFailure { e ->
+        }
+        built.onSuccess { pipeline = it }.onFailure { e ->
             uiState = UiState.Error(e.message ?: "Failed to load speech model")
-        }.getOrNull()
+        }
     }
-    DisposableEffect(pipeline) {
+    // Teardown on leaving composition. Keyed on Unit, not pipeline, because scope and
+    // transcribeDispatcher outlive any single loaded model - a Whisper<->Clinical swap must
+    // not tear them down (the swap releases its own outgoing pipeline in the LaunchedEffect
+    // above). `pipeline` is read here at dispose time to release whichever model is resident.
+    DisposableEffect(Unit) {
         onDispose {
+            val current = pipeline
             val pendingStop = stopRecordingJob
             if (pendingStop != null && !pendingStop.isCompleted) {
                 // A stopRecording() call is already in flight on `scope` (e.g. an Android
@@ -239,7 +280,7 @@ fun App(
                 // synchronous native call, and only then cancel scope.
                 scope.launch {
                     pendingStop.join()
-                    pipeline?.release()
+                    current?.release()
                     transcribeDispatcher.close()
                     scope.cancel()
                 }
@@ -251,7 +292,7 @@ fun App(
                 // tradeoff as before. Every other state (Idle, Starting, PermissionDenied,
                 // Error, or Stopping that already completed) is safe to release immediately.
                 scope.cancel()
-                pipeline?.release()
+                current?.release()
                 transcribeDispatcher.close()
             }
         }
@@ -288,7 +329,7 @@ fun App(
         isTranscribing = false
         debugLog("App.startRecording: entered, engine=$selectedEngine")
         when (selectedEngine) {
-            AsrEngine.WHISPER -> {
+            AsrEngine.WHISPER, AsrEngine.WHISPER_CLINICAL -> {
                 val activePipeline = pipeline ?: return
                 uiState = UiState.Recording
 
@@ -399,7 +440,7 @@ fun App(
     suspend fun stopRecording() {
         debugLog("App.stopRecording: entered, engine=$selectedEngine")
         when (selectedEngine) {
-            AsrEngine.WHISPER -> {
+            AsrEngine.WHISPER, AsrEngine.WHISPER_CLINICAL -> {
                 val activePipeline = pipeline ?: return
                 val t0 = nowMs()
                 audioCapture.stop()
@@ -451,7 +492,7 @@ fun App(
         val endToEndMs = nowMs() - recordStartMs
         debugLog("App.stopRecording: end-to-end time=${endToEndMs}ms")
         val summary = when (selectedEngine) {
-            AsrEngine.WHISPER -> {
+            AsrEngine.WHISPER, AsrEngine.WHISPER_CLINICAL -> {
                 val firstSegmentText = timeToFirstSegmentMs?.let { "${formatThousands(it)}ms" } ?: "n/a"
                 val avgRtf = if (segmentMetrics.isNotEmpty()) roundTo2(segmentMetrics.map { it.rtf }.average()) else 0.0
                 val maxRtf = segmentMetrics.maxOfOrNull { it.rtf } ?: 0.0
@@ -621,15 +662,38 @@ fun App(
             }
 
             if (uiState !is UiState.PermissionDenied && uiState !is UiState.Error) {
-                if (nativeAsr != null) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally)
+                // Shown while the whisper-variant LaunchedEffect is (re)loading a model - on
+                // first launch and for the ~1-3s after a Whisper<->Clinical switch. NATIVE
+                // doesn't use the pipeline, so no notice there.
+                if (pipeline == null && selectedEngine != AsrEngine.NATIVE) {
+                    Text(
+                        "Loading ${if (useClinicalModel) "clinical" else "stock"} model…",
+                        color = Color.Gray,
+                        fontSize = 12.sp,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally)
+                ) {
+                    // A model swap reloads native contexts and must not race a recording, so the
+                    // toggles are live only while Idle with the selected model already loaded.
+                    val toggleEnabled = uiState == UiState.Idle && pipeline != null
+                    EngineToggleButton("Whisper", selectedEngine == AsrEngine.WHISPER, toggleEnabled) {
+                        selectedEngine = AsrEngine.WHISPER
+                        useClinicalModel = false
+                    }
+                    EngineToggleButton(
+                        "Clinical",
+                        selectedEngine == AsrEngine.WHISPER_CLINICAL,
+                        toggleEnabled
                     ) {
-                        val toggleEnabled = uiState == UiState.Idle
-                        EngineToggleButton("Whisper", selectedEngine == AsrEngine.WHISPER, toggleEnabled) {
-                            selectedEngine = AsrEngine.WHISPER
-                        }
+                        selectedEngine = AsrEngine.WHISPER_CLINICAL
+                        useClinicalModel = true
+                    }
+                    if (nativeAsr != null) {
                         EngineToggleButton(
                             "Native",
                             selectedEngine == AsrEngine.NATIVE,
@@ -645,6 +709,11 @@ fun App(
                 ) {
                     Button(
                         onClick = { onRecordButtonClick() },
+                        // Disabled only while a Whisper model is still loading (nothing to
+                        // record into yet); NATIVE needs no pipeline, and once Recording/
+                        // Stopping the button must stay live to take the Stop tap.
+                        enabled = selectedEngine == AsrEngine.NATIVE || pipeline != null ||
+                            uiState == UiState.Recording || uiState == UiState.Stopping,
                         modifier = Modifier.size(120.dp),
                         shape = CircleShape,
                         contentPadding = ButtonDefaults.TextButtonContentPadding

@@ -4,6 +4,7 @@ import java.io.File
 
 actual class ModelPathProvider actual constructor(private val context: ApplicationContext) {
     actual fun resolveModelPath(): String = resolveAsset("ggml-small.bin")
+    actual fun resolveClinicalModelPath(): String = resolveAsset("ggml-small-clinical-de.bin")
     actual fun resolveVadModelPath(): String = resolveAsset("ggml-silero-v6.2.0.bin")
 
     private fun resolveAsset(filename: String): String {

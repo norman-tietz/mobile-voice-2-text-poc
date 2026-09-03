@@ -4,6 +4,7 @@ import platform.Foundation.NSBundle
 
 actual class ModelPathProvider actual constructor(context: ApplicationContext) {
     actual fun resolveModelPath(): String = resolveBundleResource("ggml-small")
+    actual fun resolveClinicalModelPath(): String = resolveBundleResource("ggml-small-clinical-de")
     actual fun resolveVadModelPath(): String = resolveBundleResource("ggml-silero-v6.2.0")
 
     private fun resolveBundleResource(name: String): String {

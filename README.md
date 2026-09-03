@@ -73,18 +73,29 @@ AudioCapture (mic) → resampleTo16k → audioChannel
 Everything except the two native `WhisperEngine` bindings and the two
 `AudioCapture` bindings is shared Kotlin in `commonMain`.
 
-## Comparing against Android's native recognizer
+## Comparing engines by ear
 
-On Android only, a toggle next to the Record button switches between the
-Whisper pipeline above and Android's on-device `SpeechRecognizer`
-(`AndroidSpeechRecognizerEngine`), gated on
-`SpeechRecognizer.isOnDeviceRecognitionAvailable` (requires Android 12/API 31+)
-so it never falls back to cloud-based recognition. This exists purely to
-let the two engines' output be compared by ear on the same device — see
-`docs/superpowers/specs/2026-08-24-native-asr-comparison-design.md`. Each
-recording in the transcript is tagged with the engine that produced it
-(a "Whisper"/"Native" chip shown once at the start of the recording,
-not repeated per segment). The toggle doesn't appear on iOS.
+A toggle next to the Record button switches the engine used for the next
+recording. Every recording in the transcript is tagged with the engine that
+produced it (a "Whisper"/"Clinical"/"Native" chip shown once at the start of
+the recording, not repeated per segment), so their output can be compared by
+ear on the same device.
+
+- **Whisper** — the stock `ggml-small` pipeline described above.
+- **Clinical** — the same pipeline with a clinical-context fine-tune of
+  `ggml-small` swapped in (`scripts/build-clinical-model.sh`; the fine-tuned
+  weights come from the separate `medical-data-sources` project). Decoding
+  parameters are identical to Whisper — only the model file differs.
+  Switching to or from this option reloads the model (~1–3 s, with a
+  "Loading model…" notice); the toggles and Record button are disabled
+  during the reload.
+- **Native** (Android only) — Android's on-device `SpeechRecognizer`
+  (`AndroidSpeechRecognizerEngine`), gated on
+  `SpeechRecognizer.isOnDeviceRecognitionAvailable` (requires Android 12/API
+  31+) so it never falls back to cloud-based recognition. See
+  `docs/superpowers/specs/2026-08-24-native-asr-comparison-design.md`.
+
+iOS shows the Whisper/Clinical toggle but not Native.
 
 ## Tech stack
 
@@ -133,6 +144,30 @@ The second script downloads the small Silero VAD model
 segmentation, and places a copy at both platforms' expected asset locations.
 It's also gitignored — run it once per fresh checkout, same as the model
 script above.
+
+### Optional: the clinical fine-tune
+
+The "Clinical" engine toggle needs a third model asset
+(`ggml-small-clinical-de.bin`). It isn't downloadable — it's converted from a
+fine-tuned Hugging Face checkpoint produced by the separate
+`medical-data-sources` project. Copy that checkpoint into `models-src/`
+(gitignored) and run the build script:
+
+```bash
+cp -r <medical-data-sources>/data/finetune/whisper-small-clinical-de models-src/
+./scripts/build-clinical-model.sh
+```
+
+It converts the safetensors checkpoint to ggml (`convert-h5-to-ggml.py` from
+the vendored whisper.cpp, plus one asset file fetched from `openai/whisper`),
+q8_0-quantizes it the same way `download-model.sh` does, and places a copy at
+both platforms' asset locations. If `cmake` + a C/C++ toolchain aren't
+available it ships the unquantized fp16 model instead (~465 MiB vs ~252 MiB);
+delete
+`composeApp/src/androidMain/assets/models/ggml-small-clinical-de.bin` and
+re-run on a machine with the toolchain to swap in the quantized version.
+Without this asset the app still builds and runs — only the Clinical toggle
+fails (surfaced as an on-screen error when selected).
 
 ## Building & running — Android
 
